@@ -1,10 +1,5 @@
 import type { TestConfig } from "./utils/test.util";
-import {
-  createClusterTestClient,
-  getConfig,
-  wait,
-  waitClientReady,
-} from "./utils/test.util";
+import { createClusterTestClient, getConfig, wait } from "./utils/test.util";
 
 import { FaultInjectorClient } from "./utils/fault-injector";
 import { TestCommandRunner } from "./utils/command-runner";
@@ -28,18 +23,29 @@ describe("Sharded Pub/Sub E2E", () => {
     let publisher: Cluster;
     let messageTracker: MessageTracker;
 
-    beforeEach(async () => {
+    beforeEach((done) => {
       messageTracker = new MessageTracker(CHANNELS);
       subscriber = createClusterTestClient(config.clientConfig, {
         shardedSubscribers: true,
       });
+      subscriber.on("error", (err) => {
+        console.error("Subscriber error:", err);
+      });
       publisher = createClusterTestClient(config.clientConfig, {
         shardedSubscribers: true,
       });
+      publisher.on("error", (err) => {
+        console.error("Publisher error:", err);
+      });
+      done();
     });
 
     afterEach(async () => {
-      await Promise.all([subscriber.quit(), publisher.quit()]);
+      try {
+        await Promise.all([subscriber.quit(), publisher.quit()]);
+      } catch (e) {
+        console.error(e);
+      }
     });
 
     it("should receive messages published to multiple channels", async () => {
@@ -239,26 +245,39 @@ describe("Sharded Pub/Sub E2E", () => {
     let messageTracker1: MessageTracker;
     let messageTracker2: MessageTracker;
 
-    beforeEach(async () => {
+    beforeEach(() => {
       messageTracker1 = new MessageTracker(CHANNELS);
       messageTracker2 = new MessageTracker(CHANNELS);
       subscriber1 = createClusterTestClient(config.clientConfig, {
         shardedSubscribers: true,
       });
+      subscriber1.on("error", (err) => {
+        console.error("Subscriber error:", err);
+      });
       subscriber2 = createClusterTestClient(config.clientConfig, {
         shardedSubscribers: true,
+      });
+      subscriber2.on("error", (err) => {
+        console.error("Subscriber error:", err);
       });
       publisher = createClusterTestClient(config.clientConfig, {
         shardedSubscribers: true,
       });
+      publisher.on("error", (err) => {
+        console.error("Publisher error:", err);
+      });
     });
 
     afterEach(async () => {
-      await Promise.all([
-        subscriber1.quit(),
-        subscriber2.quit(),
-        publisher.quit(),
-      ]);
+      try {
+        await Promise.all([
+          subscriber1.quit(),
+          subscriber2.quit(),
+          publisher.quit(),
+        ]);
+      } catch (e) {
+        console.error(e);
+      }
     });
 
     it("should receive messages published to multiple channels", async () => {
