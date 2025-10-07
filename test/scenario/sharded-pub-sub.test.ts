@@ -42,7 +42,8 @@ describe("Sharded Pub/Sub E2E", () => {
 
     afterEach(async () => {
       try {
-        await Promise.all([subscriber.quit(), publisher.quit()]);
+        subscriber.disconnect();
+        publisher.disconnect();
       } catch (e) {
         console.error(e);
       }
@@ -270,11 +271,9 @@ describe("Sharded Pub/Sub E2E", () => {
 
     afterEach(async () => {
       try {
-        await Promise.all([
-          subscriber1.quit(),
-          subscriber2.quit(),
-          publisher.quit(),
-        ]);
+        subscriber1.disconnect();
+        subscriber2.disconnect();
+        publisher.disconnect();
       } catch (e) {
         console.error(e);
       }
