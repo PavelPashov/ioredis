@@ -1,4 +1,4 @@
-import { wait } from "./test.util";
+import { CreateDatabaseConfig, wait } from "./test.util";
 
 export type ActionType =
   | "dmc_restart"
@@ -10,7 +10,14 @@ export type ActionType =
   | "execute_rladmin_command"
   | "migrate"
   | "bind"
-  | "update_cluster_config";
+  | "update_cluster_config"
+  | "shard_failure"
+  | "node_failure"
+  | "node_remove"
+  | "proxy_failure"
+  | "cluster_failure"
+  | "delete_database"
+  | "create_database";
 
 export interface ActionRequest {
   type: ActionType;
@@ -141,5 +148,43 @@ export class FaultInjectorClient {
         `HTTP ${response.status} - Unable to parse response as JSON`
       );
     }
+  }
+
+  /**
+   * Deletes a database.
+   * @param clusterIndex The index of the cluster
+   * @param bdbId The database ID
+   * @throws {Error} When the HTTP request fails or response cannot be parsed as JSON
+   */
+  public deleteDatabase<T extends { action_id: string }>(
+    bdbId: number | string,
+    clusterIndex: number = 0
+  ): Promise<T> {
+    return this.triggerAction<T>({
+      type: "delete_database",
+      parameters: {
+        cluster_index: clusterIndex,
+        bdb_id: bdbId.toString(),
+      },
+    });
+  }
+
+  /**
+   * Creates a new database.
+   * @param clusterIndex The index of the cluster
+   * @param databaseConfig The database configuration
+   * @throws {Error} When the HTTP request fails or response cannot be parsed as JSON
+   */
+  public createDatabase<T extends { action_id: string }>(
+    databaseConfig: CreateDatabaseConfig,
+    clusterIndex: number = 0
+  ): Promise<T> {
+    return this.triggerAction<T>({
+      type: "create_database",
+      parameters: {
+        cluster_index: clusterIndex,
+        database_config: databaseConfig,
+      },
+    });
   }
 }

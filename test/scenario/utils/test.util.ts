@@ -1,6 +1,7 @@
 import { readFileSync } from "fs";
 import { Cluster } from "../../../lib";
 import { IClusterOptions } from "../../../lib/cluster/ClusterOptions";
+import { MessageTracker } from "./message-tracker";
 
 interface DatabaseEndpoint {
   addr: string[];
@@ -13,7 +14,7 @@ interface DatabaseEndpoint {
   uid: string;
 }
 
-interface DatabaseConfig {
+export interface DatabaseConfig {
   bdb_id: number;
   username: string;
   password: string;
@@ -41,6 +42,35 @@ export interface RedisConnectionConfig {
 export interface TestConfig {
   clientConfig: RedisConnectionConfig;
   faultInjectorUrl: string;
+}
+
+export interface DatabaseModule {
+  module_name: string;
+  // Add additional module properties as needed based on your Go struct
+  [key: string]: unknown;
+}
+
+export interface ShardKeyRegexPattern {
+  regex: string;
+  // Add additional pattern properties as needed based on your Go struct
+  [key: string]: unknown;
+}
+
+export interface CreateDatabaseConfig {
+  name: string;
+  port: number;
+  memory_size: number;
+  replication: boolean;
+  eviction_policy: string;
+  sharding: boolean;
+  auto_upgrade: boolean;
+  shards_count: number;
+  module_list?: DatabaseModule[];
+  oss_cluster: boolean;
+  oss_cluster_api_preferred_ip_type?: string;
+  proxy_policy?: string;
+  shards_placement?: string;
+  shard_key_regex?: ShardKeyRegexPattern[];
 }
 
 /**
@@ -209,6 +239,129 @@ export const waitClientReady = async (client: Cluster, timeoutMs = 5_000) => {
 export const wait = (ms: number) => {
   return new Promise((resolve) => setTimeout(resolve, ms));
 };
+
+export const setupMultipleClients = async (
+  config: RedisConnectionConfig,
+  {
+    publisherCount,
+    subscriberCount,
+    publisherOverrides,
+    subscriberOverrides,
+  }: {
+    publisherCount?: number;
+    subscriberCount?: number;
+    publisherOverrides?: Partial<IClusterOptions>;
+    subscriberOverrides?: Partial<IClusterOptions>;
+  } = {}
+) => {
+  const numPublishers = publisherCount ?? 1;
+  const numSubscribers = subscriberCount ?? 1;
+
+  const publishers: Cluster[] = [];
+  const subscribers: Cluster[] = [];
+
+  for (let i = 0; i < numPublishers; i++) {
+    publishers.push(createClusterTestClient(config, publisherOverrides));
+  }
+
+  for (let i = 0; i < numSubscribers; i++) {
+    subscribers.push(
+      createClusterTestClient(config, {
+        shardedSubscribers: true,
+        ...subscriberOverrides,
+      })
+    );
+  }
+
+  const messageTracker = new MessageTracker(CHANNELS);
+
+  const ready = async () => {
+    await Promise.all([
+      ...publishers.map((publisher) => waitClientReady(publisher)),
+      ...subscribers.map((subscriber) => waitClientReady(subscriber)),
+    ]);
+  };
+
+  // Return cleanup function along with the resources
+  const cleanup = async () => {
+    await Promise.all([
+      ...publishers.map((publisher) => publisher.quit()),
+      ...subscribers.map((subscriber) => subscriber.quit()),
+    ]);
+  };
+
+  return { publishers, subscribers, messageTracker, cleanup, ready };
+};
+
+export const setupClients = async (
+  config: RedisConnectionConfig,
+  {
+    publisherOverrides,
+    subscriberOverrides,
+  }: {
+    publisherOverrides?: Partial<IClusterOptions>;
+    subscriberOverrides?: Partial<IClusterOptions>;
+  } = {}
+) => {
+  const { publishers, subscribers, messageTracker, cleanup, ready } =
+    await setupMultipleClients(config, {
+      publisherCount: 1,
+      subscriberCount: 1,
+      publisherOverrides,
+      subscriberOverrides,
+    });
+
+  return {
+    publisher: publishers[0],
+    subscriber: subscribers[0],
+    messageTracker,
+    cleanup,
+    ready,
+  };
+};
+
+export class TestContext {
+  private cleanups: Array<() => Promise<void>> = [];
+  private clientConfig: RedisConnectionConfig;
+
+  constructor(clientConfig: RedisConnectionConfig) {
+    this.clientConfig = clientConfig;
+  }
+
+  getClientConfig() {
+    return this.clientConfig;
+  }
+
+  registerConfig(config: DatabaseConfig) {
+    const rawEndpoints = config.raw_endpoints[0];
+
+    if (!rawEndpoints) {
+      throw new Error("No endpoints found in database config");
+    }
+
+    this.clientConfig = {
+      host: rawEndpoints.dns_name,
+      port: rawEndpoints.port,
+      username: config.username,
+      password: config.password,
+      tls: config.tls,
+      bdbId: config.bdb_id,
+    };
+  }
+
+  registerCleanup(cleanup: () => Promise<void>) {
+    this.cleanups.push(cleanup);
+  }
+
+  async runCleanups() {
+    for (const cleanup of this.cleanups.reverse()) {
+      try {
+        await cleanup();
+      } catch {}
+    }
+    this.cleanups = [];
+  }
+}
 
 /**
  * A list of example Redis Cluster channel keys covering all slot ranges.
