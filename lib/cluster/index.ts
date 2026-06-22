@@ -27,6 +27,7 @@ import ConnectionPool from "./ConnectionPool";
 import DelayQueue from "./DelayQueue";
 import {
   getConnectionName,
+  getNodeKey,
   getUniqueHostnamesFromOptions,
   groupSrvRecords,
   NodeKey,
@@ -42,6 +43,7 @@ import ClusterSubscriberGroup from "./ClusterSubscriberGroup";
 const debug = Debug("cluster");
 
 const REJECT_OVERWRITTEN_COMMANDS = new WeakSet<Command>();
+const COMMANDS_TO_REDIS = new WeakMap<Command, Redis>();
 
 type OfflineQueueItem = {
   command: Command;
@@ -539,14 +541,11 @@ class Cluster extends Commander {
           moved: function (slot, key) {
             debug("command %s is moved to %s", command.name, key);
             targetSlot = Number(slot);
-            if (_this.slots[slot]) {
-              _this.slots[slot][0] = key;
-            } else {
-              _this.slots[slot] = [key];
-            }
-            _this._groupsBySlot[slot] =
-              _this._groupsIds[_this.slots[slot].join(";")];
-            _this.connectionPool.findOrCreate(_this.natMapper(key));
+            _this.handleMovedRedirect(
+              slot,
+              key,
+              COMMANDS_TO_REDIS.get(command)
+            );
             tryConnection();
             debug("refreshing slot caches... (triggered by MOVED error)");
             _this.refreshSlotsCache();
@@ -698,6 +697,7 @@ class Cluster extends Commander {
         return;
       }
 
+      COMMANDS_TO_REDIS.set(command, redis);
       redis.sendCommand(command, stream);
     }
     return command.promise;
@@ -779,6 +779,31 @@ class Cluster extends Commander {
       });
     } else {
       handlers.defaults();
+    }
+  }
+
+  /**
+   * @ignore
+   */
+  handleMovedRedirect(slot: string, key: string, redis?: Redis): void {
+    if (this.slots[slot]) {
+      this.slots[slot][0] = key;
+    } else {
+      this.slots[slot] = [key];
+    }
+    this._groupsBySlot[slot] = this._groupsIds[this.slots[slot].join(";")];
+
+    const mapped = this.natMapper(key);
+    const redisKey =
+      redis &&
+      getNodeKey({
+        host: redis.options.host || "127.0.0.1",
+        port: redis.options.port || 6379,
+      });
+    if (redisKey && redisKey === getNodeKey(mapped)) {
+      this.connectionPool.refresh(mapped);
+    } else {
+      this.connectionPool.findOrCreate(mapped);
     }
   }
 

@@ -43,6 +43,7 @@ class Pipeline extends Commander<{ type: "pipeline" }> {
   private _transactions = 0;
   private _shaToScript = {};
   private preferKey: string;
+  private sourceRedis: Redis;
 
   constructor(public redis: Redis | Cluster) {
     super();
@@ -165,15 +166,7 @@ class Pipeline extends Commander<{ type: "pipeline" }> {
         cluster.handleError(commonError, this.leftRedirections, {
           moved: function (_slot: string, key: string) {
             _this.preferKey = key;
-            if (cluster.slots[errv[1]]) {
-                if (cluster.slots[errv[1]][0] !== key) {
-                  cluster.slots[errv[1]] = [key];
-                }
-            } else {
-              cluster.slots[errv[1]] = [key];
-            }
-            cluster._groupsBySlot[errv[1]] =
-              cluster._groupsIds[cluster.slots[errv[1]].join(";")];
+            cluster.handleMovedRedirect(errv[1], key, _this.sourceRedis);
             cluster.refreshSlotsCache();
             _this.exec();
           },
@@ -405,6 +398,9 @@ Pipeline.prototype.exec = function (callback: Callback): Promise<Array<any>> {
 
     for (let i = 0; i < _this._queue.length; ++i) {
       _this.redis.sendCommand(_this._queue[i], stream, node);
+    }
+    if (_this.isCluster) {
+      _this.sourceRedis = node.redis;
     }
     return _this.promise;
   }

@@ -108,6 +108,60 @@ describe("cluster:pipeline", () => {
       });
   });
 
+  it("refreshes the connection before retrying circular MOVED", (done) => {
+    const slotTable = [[0, 16383, ["127.0.0.1", 30001]]];
+    let setCount = 0;
+    let firstSetSocket = null;
+    let retriedOnFreshConnection = false;
+
+    new MockServer(
+      30001,
+      (argv, socket) => {
+        if (argv[0] === "set" && argv[1] === "foo") {
+          setCount += 1;
+          if (!firstSetSocket) {
+            firstSetSocket = socket;
+            return new Error(
+              "MOVED " + calculateSlot("foo") + " 127.0.0.1:30001"
+            );
+          }
+
+          retriedOnFreshConnection = socket !== firstSetSocket;
+          if (retriedOnFreshConnection) {
+            return "OK";
+          }
+
+          return new Error(
+            "MOVED " + calculateSlot("foo") + " 127.0.0.1:30001"
+          );
+        }
+      },
+      slotTable
+    );
+
+    const cluster = new Cluster([{ host: "127.0.0.1", port: "30001" }], {
+      maxRedirections: 4,
+    });
+    cluster.once("ready", () => {
+      cluster
+        .pipeline()
+        .set("foo", "bar")
+        .exec((err, result) => {
+          try {
+            expect(err).to.eql(null);
+            expect(result[0]).to.eql([null, "OK"]);
+            expect(setCount).to.eql(2);
+            expect(retriedOnFreshConnection).to.eql(true);
+            cluster.disconnect();
+            done();
+          } catch (error) {
+            cluster.disconnect();
+            done(error);
+          }
+        });
+    });
+  });
+
   it("should auto redirect commands on ASK", (done) => {
     let asked = false;
     const slotTable = [

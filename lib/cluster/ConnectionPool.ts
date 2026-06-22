@@ -129,10 +129,12 @@ export default class ConnectionPool extends EventEmitter {
       this.nodes[readOnly ? "slave" : "master"][key] = redis;
 
       redis.once("end", () => {
-        this.removeNode(key);
-        this.emit("-node", redis, key);
-        if (!Object.keys(this.nodes.all).length) {
-          this.emit("drain");
+        const removed = this.removeNode(key, redis);
+        if (removed || !this.nodes.all[key]) {
+          this.emit("-node", redis, key);
+          if (!Object.keys(this.nodes.all).length) {
+            this.emit("drain");
+          }
         }
       });
 
@@ -144,6 +146,19 @@ export default class ConnectionPool extends EventEmitter {
     }
 
     return redis;
+  }
+
+  refresh(node: RedisOptions, readOnly = false): Redis {
+    const key = getNodeKey(node);
+    const redis = this.nodes.all[key];
+
+    if (redis) {
+      debug("Refreshing connection to %s", key);
+      redis.disconnect();
+      this.removeNode(key, redis);
+    }
+
+    return this.findOrCreate(node, readOnly);
   }
 
   /**
@@ -179,13 +194,20 @@ export default class ConnectionPool extends EventEmitter {
   /**
    * Remove a node from the pool.
    */
-  private removeNode(key: string): void {
+  private removeNode(key: string, redis?: Redis): boolean {
     const { nodes } = this;
+    if (redis && nodes.all[key] !== redis) {
+      return false;
+    }
+
+    const node = nodes.all[key];
     if (nodes.all[key]) {
       debug("Remove %s from the pool", key);
       delete nodes.all[key];
     }
     delete nodes.master[key];
     delete nodes.slave[key];
+
+    return Boolean(node);
   }
 }

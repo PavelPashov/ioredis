@@ -76,6 +76,57 @@ describe("cluster:MOVED", () => {
     });
   });
 
+  it("refreshes the connection before retrying a circular MOVED", (done) => {
+    const slotTable = [[0, 16383, ["127.0.0.1", 30001]]];
+    let getCount = 0;
+    let firstGetSocket = null;
+    let retriedOnFreshConnection = false;
+
+    new MockServer(
+      30001,
+      (argv, socket) => {
+        if (argv[0] === "get" && argv[1] === "foo") {
+          getCount += 1;
+          if (!firstGetSocket) {
+            firstGetSocket = socket;
+            return new Error(
+              "MOVED " + calculateSlot("foo") + " 127.0.0.1:30001"
+            );
+          }
+
+          retriedOnFreshConnection = socket !== firstGetSocket;
+          if (retriedOnFreshConnection) {
+            return "bar";
+          }
+
+          return new Error(
+            "MOVED " + calculateSlot("foo") + " 127.0.0.1:30001"
+          );
+        }
+      },
+      slotTable
+    );
+
+    const cluster = new Cluster([{ host: "127.0.0.1", port: "30001" }], {
+      maxRedirections: 4,
+    });
+    cluster.once("ready", () => {
+      cluster.get("foo", (err, res) => {
+        try {
+          expect(err).to.be.null;
+          expect(res).to.eql("bar");
+          expect(getCount).to.eql(2);
+          expect(retriedOnFreshConnection).to.eql(true);
+          cluster.disconnect();
+          done();
+        } catch (error) {
+          cluster.disconnect();
+          done(error);
+        }
+      });
+    });
+  });
+
   it("should auto redirect the command within a pipeline", (done) => {
     let cluster = undefined;
     let moved = false;
