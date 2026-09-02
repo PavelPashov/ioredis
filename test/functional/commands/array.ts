@@ -2,6 +2,7 @@ import Redis from "../../../lib/Redis";
 import { expect } from "chai";
 import { RESP_CONFIGS } from "../../helpers/respConfigs";
 import { isRedisVersionLowerThan } from "../../helpers/util";
+import { isReCluster } from "../../helpers/re-config";
 
 for (const { name, opts } of RESP_CONFIGS) {
   describe(`array commands (${name})`, () => {
