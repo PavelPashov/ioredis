@@ -8,7 +8,6 @@ interface RawEndpoint {
 interface DatabaseConfig {
   username?: string;
   password?: string;
-  tls: boolean;
   raw_endpoints?: RawEndpoint[];
   endpoints?: string[];
 }
@@ -20,7 +19,6 @@ export interface REConnection {
   port: number;
   username?: string;
   password?: string;
-  tls: boolean;
 }
 
 export function isReCluster(): boolean {
@@ -32,7 +30,7 @@ export function isReCluster(): boolean {
  *
  * Reads the database named by RE_DB_NAME (default "standalone") from the endpoints
  * config at REDIS_ENDPOINTS_CONFIG_PATH - the same format consumed by the scenario
- * tests - and returns its host, port, credentials and TLS flag.
+ * tests - and returns its host, port and credentials.
  */
 export function loadREConnection(): REConnection {
   const path = process.env.REDIS_ENDPOINTS_CONFIG_PATH;
@@ -44,7 +42,7 @@ export function loadREConnection(): REConnection {
 
   const data = JSON.parse(readFileSync(path, "utf8")) as DatabasesConfig;
   const name = process.env.RE_DB_NAME || "standalone";
-  const db = data[name] ?? Object.values(data)[0];
+  const db = data[name];
   if (!db) {
     throw new Error(`Database ${name} not found in ${path}`);
   }
@@ -72,6 +70,5 @@ export function loadREConnection(): REConnection {
     port,
     username: db.username || undefined,
     password: db.password || undefined,
-    tls: db.tls,
   };
 }

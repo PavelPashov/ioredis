@@ -17,9 +17,6 @@ if (isReCluster()) {
   if (re.password) {
     DEFAULT_REDIS_OPTIONS.password = re.password;
   }
-  if (re.tls) {
-    DEFAULT_REDIS_OPTIONS.tls = { rejectUnauthorized: false };
-  }
 }
 
 afterEach((done) => {
@@ -29,9 +26,16 @@ afterEach((done) => {
     // A managed Redis Enterprise database does not permit CLIENT KILL / SCRIPT FLUSH
     // for the default user, and killing connections would disrupt the shared proxy;
     // FLUSHALL alone is enough to isolate tests on a dedicated BDB.
-    new Redis().flushall().then(
-      () => done(),
-      (err) => done(err)
+    const cleanupClient = new Redis();
+    cleanupClient.flushall().then(
+      () => {
+        cleanupClient.disconnect();
+        done();
+      },
+      (err) => {
+        cleanupClient.disconnect();
+        done(err);
+      }
     );
     return;
   }
