@@ -31,6 +31,8 @@ export default class ClusterSubscriberGroup {
   private static readonly MAX_RETRY_ATTEMPTS = 10;
   private static readonly MAX_BACKOFF_MS = 2000;
   private static readonly BASE_BACKOFF_MS = 100;
+  // Max wait for an SSUBSCRIBE acknowledgement when no commandTimeout is set
+  private static readonly SUBSCRIPTION_TIMEOUT_MS = 10_000;
 
   /**
    * Register callbacks
@@ -399,20 +401,10 @@ export default class ClusterSubscriberGroup {
                 }
 
                 if (redis.status === "ready") {
-                  redis.ssubscribe(...channels).catch((err) => {
-                    // TODO: Should we emit an error event here?
-                    debug("Failed to ssubscribe on node %s: %s", nodeKey, err);
-                  });
+                  this.trackResubscription(s, redis.ssubscribe(...channels));
                 } else {
                   redis.once("ready", () => {
-                    redis.ssubscribe(...channels).catch((err) => {
-                      // TODO: Should we emit an error event here?
-                      debug(
-                        "Failed to ssubscribe on node %s: %s",
-                        nodeKey,
-                        err,
-                      );
-                    });
+                    this.trackResubscription(s, redis.ssubscribe(...channels));
                   });
                 }
               }
@@ -421,6 +413,43 @@ export default class ClusterSubscriberGroup {
         },
       );
     }
+  }
+
+  /**
+   * A resubscription that is rejected or never acknowledged leaves its channels
+   * dead while the connection still looks healthy, so `reset()` would keep
+   * skipping it. Treat it like a failed connection: stop the subscriber and
+   * schedule a refresh, which replaces it with a fresh connection.
+   */
+  private trackResubscription(sub: ShardedSubscriber, ack: Promise<unknown>) {
+    const nodeKey = sub.getNodeKey();
+    const timeout =
+      sub.getInstance()?.options.commandTimeout ??
+      ClusterSubscriberGroup.SUBSCRIPTION_TIMEOUT_MS;
+
+    let timer: NodeJS.Timeout;
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          new Error(
+            `SSUBSCRIBE on ${nodeKey} was not acknowledged within ${timeout}ms`
+          )
+        );
+      }, timeout);
+    });
+
+    Promise.race([ack, timedOut])
+      .catch((err) => {
+        // Stale outcome: subscriber already replaced or stopped (e.g. this
+        // rejection is our own disconnect flushing the command queue).
+        if (this.shardedSubscribers.get(nodeKey) !== sub || !sub.isHealthy()) {
+          return;
+        }
+        debug("Failed to ssubscribe on node %s: %s", nodeKey, err);
+        sub.stop();
+        this.handleSubscriberConnectFailed(err, nodeKey);
+      })
+      .finally(() => clearTimeout(timer));
   }
 
   /**
