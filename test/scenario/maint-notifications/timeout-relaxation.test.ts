@@ -19,6 +19,12 @@ import {
 
 const NORMAL_COMMAND_TIMEOUT = 100;
 const RELAXED_COMMAND_TIMEOUT = 2_000;
+/**
+ * libuv tracks timers on a millisecond-granular loop clock, so a timer can
+ * fire up to 1ms before its nominal delay, and Date.now() truncation adds
+ * up to another 1ms to the measured shortfall.
+ */
+const TIMER_TOLERANCE = 2;
 
 /**
  * The effects this suite exercises. Timeout relaxation needs the maintenance
@@ -81,7 +87,7 @@ const measureCommandTimeout = async (
 const assertNormalTimeout = ({ error, duration }: TimeoutMeasurement) => {
   assert.instanceOf(error, Error);
   assert.strictEqual(error!.message, "Command timed out");
-  assert.isAtLeast(duration, NORMAL_COMMAND_TIMEOUT);
+  assert.isAtLeast(duration, NORMAL_COMMAND_TIMEOUT - TIMER_TOLERANCE);
   assert.isBelow(duration, RELAXED_COMMAND_TIMEOUT * 0.8);
 };
 
@@ -279,7 +285,7 @@ describe("Timeout Relaxation During Maintenance E2E", function () {
         const duration = Date.now() - start;
 
         assert.strictEqual(err.name, "Error");
-        assert.isAtLeast(duration, SOCKET_TIMEOUT);
+        assert.isAtLeast(duration, SOCKET_TIMEOUT - TIMER_TOLERANCE);
         assert.isBelow(duration, RELAXED_SOCKET_TIMEOUT * 0.8);
       } finally {
         baseline.socketClient.disconnect();
