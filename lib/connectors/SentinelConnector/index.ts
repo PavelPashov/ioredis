@@ -97,12 +97,16 @@ export default class SentinelConnector extends AbstractConnector {
         this.options.role,
         info.role
       );
-      // Start from the next item.
-      // Note that `reset` will move the cursor to the previous element,
-      // so we advance two steps here.
+      // Move the current sentinel to the first position, then start from the
+      // next item. Note that `reset` will move the cursor to the previous
+      // element, so we advance two steps here.
+      this.sentinelIterator.reset(true);
       this.sentinelIterator.next();
       this.sentinelIterator.next();
       this.sentinelIterator.reset(true);
+    } else if (this.options.failoverDetector) {
+      // The node is ready, so retry from the current sentinel next time.
+      this.sentinelIterator.reset(false);
     }
     return roleMatches;
   }
@@ -120,6 +124,12 @@ export default class SentinelConnector extends AbstractConnector {
     this.retryAttempts = 0;
 
     let lastError;
+
+    // Move the sentinel at the cursor to the first position (wrapping to the
+    // first sentinel at the end), so all sentinels are tried before they are
+    // reported as unreachable.
+    const { done } = this.sentinelIterator.next();
+    this.sentinelIterator.reset(!done);
 
     const connectToNext = async (): Promise<NetStream> => {
       const endpoint = this.sentinelIterator.next();
@@ -385,6 +395,11 @@ export default class SentinelConnector extends AbstractConnector {
     }
 
     this.sentinelIterator.reset(false);
+    if ((this.options as RedisOptions).enableReadyCheck) {
+      // Keep the cursor after the current sentinel until `check()` confirms
+      // the node, so a failure before that retries from the next sentinel.
+      this.sentinelIterator.next();
+    }
 
     if (this.failoverDetector) {
       // Clean up previous detector

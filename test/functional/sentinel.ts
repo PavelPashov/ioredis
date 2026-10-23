@@ -635,6 +635,143 @@ describe("sentinel", () => {
     });
   });
 
+  describe("retry order", () => {
+    type NodeBehavior =
+      | "healthy"
+      | "closeBeforeReady"
+      | "closeOnceBeforeReady"
+      | "wrongRole";
+    // Leftover clients from other tests look up "master", so they are ignored.
+    const name = "retryOrder";
+
+    // Sentinel i reports node i. Returns the indexes of the queried sentinels.
+    function createSentinels(
+      nodes: NodeBehavior[],
+      role: "master" | "slave",
+      nodeSockets: Socket[] = []
+    ) {
+      const lookups: number[] = [];
+      nodes.forEach((behavior, index) => {
+        const port = String(17380 + index);
+        let closed = false;
+        new MockServer(17380 + index, (argv, socket, flags) => {
+          if (argv[0] === "info") {
+            if (
+              behavior === "closeBeforeReady" ||
+              (behavior === "closeOnceBeforeReady" && !closed)
+            ) {
+              closed = true;
+              flags.hang = true;
+              socket.destroy();
+              return;
+            }
+            const otherRole = role === "master" ? "slave" : "master";
+            return `role:${behavior === "wrongRole" ? otherRole : role}`;
+          }
+          if (argv[0] === "get") {
+            nodeSockets[index] = socket;
+            return `node${index}`;
+          }
+        });
+        new MockServer(27379 + index, (argv) => {
+          if (argv[0] === "subscribe") {
+            return pubSubReply(3, "subscribe", "+switch-master");
+          }
+          if (argv[0] !== "sentinel" || argv[2] !== name) {
+            return;
+          }
+          if (argv[1] === "get-master-addr-by-name") {
+            lookups.push(index);
+            return ["127.0.0.1", port];
+          }
+          if (argv[1] === "slaves") {
+            lookups.push(index);
+            return [["ip", "127.0.0.1", "port", port, "flags", "slave"]];
+          }
+        });
+      });
+      return lookups;
+    }
+
+    function createRedis(sentinelCount: number, options: object) {
+      const redis = new Redis({
+        sentinels: Array.from({ length: sentinelCount }, (_, index) => ({
+          host: "127.0.0.1",
+          port: 27379 + index,
+        })),
+        name,
+        sentinelRetryStrategy: null,
+        retryStrategy: (times) => (times < 4 ? 0 : null),
+        ...options,
+      });
+      redis.on("error", () => {});
+      return redis;
+    }
+
+    (["master", "slave"] as const).forEach((role) => {
+      it(`should query the next sentinel when the ${role} closes before ready with failoverDetector`, async () => {
+        const lookups = createSentinels(["closeBeforeReady", "healthy"], role);
+        const redis = createRedis(2, { role, failoverDetector: true });
+
+        expect(await redis.get("foo")).to.eql("node1");
+        expect(lookups).to.eql([0, 1]);
+        redis.disconnect();
+      });
+
+      it(`should not skip a sentinel when the ${role} has the wrong role`, async () => {
+        const lookups = createSentinels(
+          ["wrongRole", "healthy", "wrongRole", "healthy"],
+          role
+        );
+        const redis = createRedis(4, { role });
+
+        expect(await redis.get("foo")).to.eql("node1");
+        expect(lookups).to.eql([0, 1]);
+        redis.disconnect();
+      });
+    });
+
+    it("should query the current sentinel first after a ready connection drops with failoverDetector", async () => {
+      const nodeSockets: Socket[] = [];
+      const lookups = createSentinels(
+        ["healthy", "healthy"],
+        "master",
+        nodeSockets
+      );
+      const redis = createRedis(2, { failoverDetector: true });
+
+      await Promise.all([redis.get("foo"), once(redis, "failoverSubscribed")]);
+      nodeSockets[0].destroy();
+      await once(redis, "ready");
+
+      expect(lookups).to.eql([0, 0]);
+      redis.disconnect();
+    });
+
+    [false, true].forEach((failoverDetector) => {
+      [
+        { title: "the only sentinel", ports: [27379] },
+        // Nothing listens on 27378.
+        { title: "the only reachable sentinel", ports: [27378, 27379] },
+      ].forEach(({ title, ports }) => {
+        it(`should retry ${title} when its node closes before ready (failoverDetector: ${failoverDetector})`, async () => {
+          const lookups = createSentinels(["closeOnceBeforeReady"], "master");
+          const redis = createRedis(1, {
+            failoverDetector,
+            sentinels: ports.map((port) => ({ host: "127.0.0.1", port })),
+          });
+          const errors: string[] = [];
+          redis.on("error", (err) => errors.push(err.message));
+
+          expect(await redis.get("foo")).to.eql("node0");
+          expect(lookups).to.eql([0, 0]);
+          expect(errors).to.eql([]);
+          redis.disconnect();
+        });
+      });
+    });
+  });
+
   describe("failover", () => {
     it("should switch to new master automatically without any commands being lost", (done) => {
       const sentinel = new MockServer(27379, (argv) => {
