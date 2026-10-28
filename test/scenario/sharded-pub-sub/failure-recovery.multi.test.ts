@@ -14,6 +14,12 @@ import {
 import { TestCommandRunner } from "../utils/command-runner";
 import { MessageTracker } from "../utils/message-tracker";
 import { assert } from "chai";
+import debug from "debug";
+
+// Temporary: debug logs for the reboot failures in CI. `debug` reads DEBUG only
+// when it loads, so enable it explicitly.
+process.env.DEBUG = "ioredis:cluster,ioredis:cluster:subscriberGroup*";
+debug.enable(process.env.DEBUG);
 
 const CLUSTER_INDEX = 0;
 const POST_RECOVERY_PUBLISH_DURATION_MS = 10_000;
