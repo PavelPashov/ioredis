@@ -227,6 +227,7 @@ export default class ClusterSubscriberGroup {
     this.isResetting = true;
 
     try {
+      const previousClusterSlots = this.clusterSlots;
       const hasTopologyChanged = this._refreshSlots(clusterSlots);
       const hasFailedSubscribers = this.hasUnhealthySubscribers();
 
@@ -242,7 +243,13 @@ export default class ClusterSubscriberGroup {
         if (
           // If the subscriber is still responsible for a slot range and is healthy then keep it
           this.subscriberToSlotsIndex.has(nodeKey) &&
-          shardedSubscriber.isHealthy()
+          shardedSubscriber.isHealthy() &&
+          // Replace it if it inherits slots from a removed node: after a failover, some
+          // servers (e.g. the Redis Enterprise proxy) stop answering on old connections.
+          !(
+            shardedSubscriber.isStarted() &&
+            this.hasInheritedSlotsFromRemovedNode(nodeKey, previousClusterSlots)
+          )
         ) {
           debug("Skipping deleting subscriber for %s", nodeKey);
           continue;
@@ -442,6 +449,24 @@ export default class ClusterSubscriberGroup {
     } else {
       return JSON.stringify(this.clusterSlots) === JSON.stringify(other);
     }
+  }
+
+  /**
+   * Whether `nodeKey` now owns a slot whose previous owner is no longer in the topology.
+   */
+  private hasInheritedSlotsFromRemovedNode(
+    nodeKey: string,
+    previousClusterSlots: string[][],
+  ): boolean {
+    return this.subscriberToSlotsIndex.get(nodeKey).some((slot) => {
+      const previousOwner = previousClusterSlots[slot]?.[0];
+
+      return (
+        previousOwner !== undefined &&
+        previousOwner !== nodeKey &&
+        !this.subscriberToSlotsIndex.has(previousOwner)
+      );
+    });
   }
 
   /**

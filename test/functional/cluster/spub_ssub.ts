@@ -545,6 +545,143 @@ describe("cluster:spub/ssub", function () {
       client.disconnect();
     });
   });
+
+  ([2, 3] as const).forEach((protocol) => {
+    it(`moves inherited channels to a new connection when a subscriber gains slots - RESP ${protocol}`, async () => {
+      // During a failover the server can stop answering commands on an existing
+      // subscriber connection while still delivering its messages. A subscriber
+      // that inherits slots must not resubscribe them on that connection.
+      let slots = [
+        [0, 8191, ["127.0.0.1", 30001]],
+        [8192, 16383, ["127.0.0.1", 30002]],
+      ];
+      const stuckSockets = new Set<Socket>();
+      let onInheritedSubscribe: (socket: Socket) => void = noop;
+      const handler: MockServerHandler = (argv, socket, flags) => {
+        if (argv[0] === "cluster" && argv[1] === "SLOTS") {
+          return slots;
+        }
+        if (argv[0] === "ssubscribe") {
+          flags.hang = true;
+          if (stuckSockets.has(socket)) {
+            return;
+          }
+          argv.slice(1).forEach((channel: string, i: number) => {
+            server.write(
+              socket,
+              pubSubReply(protocol, "ssubscribe", channel, i + 1)
+            );
+          });
+          if (socket.localPort === 30001 && argv.includes("channel:{1}")) {
+            onInheritedSubscribe(socket);
+          }
+        }
+      };
+      const server = new MockServer(30001, handler);
+      new MockServer(30002, handler);
+      const cluster = new Cluster([{ host: "127.0.0.1", port: 30001 }], {
+        shardedSubscribers: true,
+        redisOptions: { protocol },
+      });
+
+      try {
+        // "channel:{3}" hashes to slot 1584 (30001), "channel:{1}" to 9842 (30002).
+        await cluster.ssubscribe("channel:{3}");
+        await cluster.ssubscribe("channel:{1}");
+
+        for (const socket of server.getAllClients()) {
+          if (getConnectionName(socket)?.includes("ssubscriber")) {
+            stuckSockets.add(socket);
+          }
+        }
+        expect(stuckSockets.size).to.equal(1);
+
+        const inheritedSubscribe = new Promise<Socket>((resolve) => {
+          onInheritedSubscribe = resolve;
+        });
+        slots = [[0, 16383, ["127.0.0.1", 30001]]];
+        await new Promise<void>((resolve, reject) => {
+          cluster.refreshSlotsCache((err) => (err ? reject(err) : resolve()));
+        });
+
+        const socket = await inheritedSubscribe;
+        expect(stuckSockets.has(socket)).to.equal(false);
+
+        const received = new Promise((resolve) => {
+          cluster.once("smessage", (channel, message) =>
+            resolve([channel, message])
+          );
+        });
+        server.write(
+          socket,
+          pubSubReply(protocol, "smessage", "channel:{1}", "after failover")
+        );
+        expect(await received).to.eql(["channel:{1}", "after failover"]);
+      } finally {
+        cluster.disconnect();
+      }
+    });
+  });
+
+  it("keeps the subscriber connection when it gains slots from a node still in the topology", async () => {
+    let slots = [
+      [0, 8191, ["127.0.0.1", 30001]],
+      [8192, 16383, ["127.0.0.1", 30002]],
+    ];
+    // Sockets on 30001 that received SSUBSCRIBE for "channel:{3}".
+    const unmovedChannelSockets: Socket[] = [];
+    let onMovedSubscribe: (socket: Socket) => void = noop;
+    const handler: MockServerHandler = (argv, socket, flags) => {
+      if (argv[0] === "cluster" && argv[1] === "SLOTS") {
+        return slots;
+      }
+      if (argv[0] === "ssubscribe") {
+        flags.hang = true;
+        argv.slice(1).forEach((channel: string, i: number) => {
+          server.write(socket, pubSubReply(3, "ssubscribe", channel, i + 1));
+        });
+        if (socket.localPort === 30001 && argv.includes("channel:{3}")) {
+          unmovedChannelSockets.push(socket);
+        }
+        if (socket.localPort === 30001 && argv.includes("channel:{1}")) {
+          onMovedSubscribe(socket);
+        }
+      }
+    };
+    const server = new MockServer(30001, handler);
+    new MockServer(30002, handler);
+    const cluster = new Cluster([{ host: "127.0.0.1", port: 30001 }], {
+      shardedSubscribers: true,
+      redisOptions: { protocol: 3 },
+    });
+
+    try {
+      // "channel:{3}" hashes to slot 1584 (30001), "channel:{1}" to 9842 (30002).
+      await cluster.ssubscribe("channel:{3}");
+      await cluster.ssubscribe("channel:{1}");
+      const [original] = unmovedChannelSockets;
+
+      const movedSubscribe = new Promise<Socket>((resolve) => {
+        onMovedSubscribe = resolve;
+      });
+      // Reshard slot 9842 to 30001 while 30002 stays in the topology.
+      slots = [
+        [0, 9999, ["127.0.0.1", 30001]],
+        [10000, 16383, ["127.0.0.1", 30002]],
+      ];
+      await new Promise<void>((resolve, reject) => {
+        cluster.refreshSlotsCache((err) => (err ? reject(err) : resolve()));
+      });
+
+      expect(await movedSubscribe).to.equal(original);
+      expect(original.destroyed).to.equal(false);
+      expect(
+        unmovedChannelSockets.every((socket) => socket === original)
+      ).to.equal(true);
+    } finally {
+      cluster.disconnect();
+    }
+  });
 });
 
 describe("cluster: sharded unsubscribe channel identity", () => {
