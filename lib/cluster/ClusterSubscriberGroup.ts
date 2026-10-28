@@ -521,7 +521,6 @@ export default class ClusterSubscriberGroup {
 
     this.subscriberGroupEmitter.emit("subscriberConnectFailed", {
       delay,
-      error,
     });
   };
 

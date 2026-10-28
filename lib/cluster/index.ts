@@ -1469,16 +1469,11 @@ class Cluster<
       this.refreshSlotsCache(refreshSlotsCacheCallback);
     });
 
-    this.subscriberGroupEmitter.on(
-      "subscriberConnectFailed",
-      ({ delay, error }) => {
-        Redis.prototype.silentEmit.call(this, "error", error);
-
-        setTimeout(() => {
-          this.refreshSlotsCache(refreshSlotsCacheCallback);
-        }, delay);
-      }
-    );
+    this.subscriberGroupEmitter.on("subscriberConnectFailed", ({ delay }) => {
+      setTimeout(() => {
+        this.refreshSlotsCache(refreshSlotsCacheCallback);
+      }, delay);
+    });
 
     this.subscriberGroupEmitter.on("moved", () => {
       this.refreshSlotsCache(refreshSlotsCacheCallback);

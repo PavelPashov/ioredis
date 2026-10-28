@@ -1451,6 +1451,7 @@ cluster
 | +node        | emits when a new node is connected.                                                                                                                                                                        |
 | -node        | emits when a node is disconnected.                                                                                                                                                                         |
 | node error   | emits when an error occurs when connecting to a node. The second argument indicates the address of the node.                                                                                               |
+| nodeError    | emits when an error occurs on a sharded subscriber connection (if `shardedSubscribers` is `true`), including a failed connection attempt. The second argument is the node key (`host:port`).               |
 
 ### Password
 
