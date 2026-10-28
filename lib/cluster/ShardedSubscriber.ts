@@ -40,6 +40,7 @@ export default class ShardedSubscriber {
   private instance: Redis | null = null;
   private connectPromise: Promise<void> | null = null;
   private lazyConnect: boolean;
+  private startTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Store listener references for cleanup
   private readonly messageListeners: Map<string, (...args: any[]) => void> =
@@ -111,7 +112,27 @@ export default class ShardedSubscriber {
     }
 
     this.updateStatus(SubscriberStatus.STARTING);
-    this.connectPromise = this.instance.connect();
+    const instance = this.instance;
+    this.connectPromise = instance.connect();
+
+    // connectTimeout only covers the TCP connect. If the server never answers
+    // the handshake, give up so the start fails instead of blocking resets.
+    const { connectTimeout } = instance.options;
+    const armStartTimer = () => {
+      this.startTimer = setTimeout(() => {
+        debug("start of %s timed out, disconnecting", this.nodeKey);
+        this.onError(
+          new Error(
+            `Sharded subscriber ${this.nodeKey} was not ready within ${connectTimeout}ms`,
+          ),
+        );
+        instance.disconnect();
+      }, connectTimeout);
+    };
+
+    if (connectTimeout) {
+      instance.once("connect", armStartTimer);
+    }
 
     try {
       await this.connectPromise;
@@ -120,12 +141,15 @@ export default class ShardedSubscriber {
       this.updateStatus(SubscriberStatus.ENDED);
       throw err;
     } finally {
+      this.clearStartTimer();
+      instance.removeListener("connect", armStartTimer);
       this.connectPromise = null;
     }
   }
 
   stop(): void {
     this.updateStatus(SubscriberStatus.STOPPING);
+    this.clearStartTimer();
 
     if (this.instance) {
       this.instance.disconnect();
@@ -170,6 +194,11 @@ export default class ShardedSubscriber {
 
   isLazyConnect(): boolean {
     return this.lazyConnect;
+  }
+
+  private clearStartTimer(): void {
+    clearTimeout(this.startTimer);
+    this.startTimer = null;
   }
 
   private onEnd = () => {
