@@ -41,6 +41,7 @@ export default class ShardedSubscriber {
   private connectPromise: Promise<void> | null = null;
   private lazyConnect: boolean;
   private startTimer: ReturnType<typeof setTimeout> | null = null;
+  private finishStart: (() => void) | null = null;
 
   // Store listener references for cleanup
   private readonly messageListeners: Map<string, (...args: any[]) => void> =
@@ -113,7 +114,12 @@ export default class ShardedSubscriber {
 
     this.updateStatus(SubscriberStatus.STARTING);
     const instance = this.instance;
-    this.connectPromise = instance.connect();
+    // stop() removes the instance's listeners, so connect() would never
+    // settle. Finish the start instead, so a reset waiting on it can finish.
+    const stopped = new Promise<void>((resolve) => {
+      this.finishStart = resolve;
+    });
+    this.connectPromise = Promise.race([instance.connect(), stopped]);
 
     // connectTimeout only covers the TCP connect. If the server never answers
     // the handshake, give up so the start fails instead of blocking resets.
@@ -142,6 +148,7 @@ export default class ShardedSubscriber {
       throw err;
     } finally {
       this.clearStartTimer();
+      this.finishStart = null;
       instance.removeListener("connect", armStartTimer);
       this.connectPromise = null;
     }
@@ -150,6 +157,10 @@ export default class ShardedSubscriber {
   stop(): void {
     this.updateStatus(SubscriberStatus.STOPPING);
     this.clearStartTimer();
+
+    if (this.finishStart) {
+      this.finishStart();
+    }
 
     if (this.instance) {
       this.instance.disconnect();
