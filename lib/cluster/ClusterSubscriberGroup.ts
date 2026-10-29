@@ -315,6 +315,7 @@ export default class ClusterSubscriberGroup {
           this.subscriberGroupEmitter,
           redis.options,
           this.options.redisOptions,
+          this.options.shardedSubscriberHealthCheckInterval,
         );
 
         this.shardedSubscribers.set(nodeKey, sub);

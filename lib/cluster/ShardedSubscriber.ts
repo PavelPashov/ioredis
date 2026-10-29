@@ -34,6 +34,8 @@ const ALLOWED_STATUS_UPDATES: Record<SubscriberStatus, SubscriberStatus[]> = {
   [SubscriberStatus.ENDED]: [],
 };
 
+const MAX_MISSED_HEALTH_CHECKS = 3;
+
 export default class ShardedSubscriber {
   private readonly nodeKey: string;
   private status: SubscriberStatus = SubscriberStatus.IDLE;
@@ -42,6 +44,7 @@ export default class ShardedSubscriber {
   private lazyConnect: boolean;
   private startTimer: ReturnType<typeof setTimeout> | null = null;
   private finishStart: (() => void) | null = null;
+  private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
 
   // Store listener references for cleanup
   private readonly messageListeners: Map<string, (...args: any[]) => void> =
@@ -51,6 +54,7 @@ export default class ShardedSubscriber {
     private readonly emitter: EventEmitter,
     options: RedisOptions,
     redisOptions?: ClusterOptions["redisOptions"],
+    private readonly healthCheckInterval?: number,
   ) {
     this.instance = new Redis(
       defaults(
@@ -143,6 +147,7 @@ export default class ShardedSubscriber {
     try {
       await this.connectPromise;
       this.updateStatus(SubscriberStatus.CONNECTED);
+      this.startHealthCheck(instance);
     } catch (err) {
       this.updateStatus(SubscriberStatus.ENDED);
       throw err;
@@ -157,6 +162,7 @@ export default class ShardedSubscriber {
   stop(): void {
     this.updateStatus(SubscriberStatus.STOPPING);
     this.clearStartTimer();
+    this.clearHealthCheck();
 
     if (this.finishStart) {
       this.finishStart();
@@ -212,7 +218,51 @@ export default class ShardedSubscriber {
     this.startTimer = null;
   }
 
+  // Some servers stop answering on a subscriber connection without closing
+  // it (e.g. the Redis Enterprise proxy after a node reboot). PING it, and
+  // drop it when it stops answering, so the group replaces it.
+  private startHealthCheck(instance: Redis): void {
+    if (!this.healthCheckInterval || this.status !== SubscriberStatus.CONNECTED) {
+      return;
+    }
+
+    let pingPending = false;
+    let missedChecks = 0;
+    const onPingAnswered = () => {
+      pingPending = false;
+      missedChecks = 0;
+    };
+
+    this.healthCheckTimer = setInterval(() => {
+      if (!pingPending) {
+        pingPending = true;
+        instance.ping().then(onPingAnswered, onPingAnswered);
+        return;
+      }
+
+      missedChecks++;
+      if (missedChecks < MAX_MISSED_HEALTH_CHECKS) {
+        return;
+      }
+
+      debug("%s missed %d health checks, disconnecting", this.nodeKey, missedChecks);
+      this.clearHealthCheck();
+      this.onError(
+        new Error(
+          `Sharded subscriber ${this.nodeKey} missed ${missedChecks} health checks`,
+        ),
+      );
+      instance.disconnect();
+    }, this.healthCheckInterval);
+  }
+
+  private clearHealthCheck(): void {
+    clearInterval(this.healthCheckTimer);
+    this.healthCheckTimer = null;
+  }
+
   private onEnd = () => {
+    this.clearHealthCheck();
     this.updateStatus(SubscriberStatus.ENDED);
     this.emitter.emit("-node", this.instance, this.nodeKey);
   };

@@ -151,6 +151,17 @@ export interface ClusterOptions extends CommanderOptions {
   shardedSubscribers?: boolean | undefined;
 
   /**
+   * Interval in milliseconds between PING health checks on each sharded
+   * subscriber connection. A subscriber that misses 3 checks in a row is
+   * reported with a `nodeError` event and replaced.
+   *
+   * Only used when `shardedSubscribers` is enabled.
+   *
+   * @default undefined (disabled)
+   */
+  shardedSubscriberHealthCheckInterval?: number | undefined;
+
+  /**
    * When a cluster node connection is closed, this function will be called
    * to determine the retry delay (in ms). Returning `null` or a non-number
    * disables reconnection for that node.
