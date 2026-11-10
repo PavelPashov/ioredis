@@ -3,6 +3,7 @@ import { getConnectionName, getNodeKey, RedisOptions } from "./util";
 import { Debug, defaults } from "../utils";
 import Redis from "../Redis";
 import { ClusterOptions } from "./ClusterOptions";
+import { ReplyError } from "redis-errors";
 import ShardedSubscriberHealthCheck from "./ShardedSubscriberHealthCheck";
 const debug = Debug("cluster:subscriberGroup:shardedSubscriber");
 
@@ -35,6 +36,26 @@ const ALLOWED_STATUS_UPDATES: Record<SubscriberStatus, SubscriberStatus[]> = {
   [SubscriberStatus.ENDED]: [],
 };
 
+// Error replies that pass once the cluster settles. A retry can succeed.
+const TRANSIENT_REPLY_ERRORS = [
+  "MOVED",
+  "ASK",
+  "CLUSTERDOWN",
+  "TRYAGAIN",
+  "LOADING",
+];
+
+/**
+ * Whether the server refused the command for good, so a retry on a new
+ * connection would get the same reply.
+ */
+function isRefusal(error: Error): boolean {
+  return (
+    error instanceof ReplyError &&
+    !TRANSIENT_REPLY_ERRORS.some((prefix) => error.message.startsWith(prefix))
+  );
+}
+
 export default class ShardedSubscriber {
   private readonly nodeKey: string;
   private status: SubscriberStatus = SubscriberStatus.IDLE;
@@ -42,6 +63,7 @@ export default class ShardedSubscriber {
   private connectPromise: Promise<void> | null = null;
   private lazyConnect: boolean;
   private finishStart: (() => void) | null = null;
+  private subscribeFailed = false;
   private readonly healthCheck: ShardedSubscriberHealthCheck | null;
 
   // Store listener references for cleanup
@@ -162,6 +184,88 @@ export default class ShardedSubscriber {
     debug("stopped %s", this.nodeKey);
   }
 
+  /**
+   * Subscribes to the channels of each slot once the connection is ready.
+   * Each entry of `channelsBySlot` holds the channels of one slot.
+   *
+   * Channels the server refuses for good (e.g. NOPERM) are reported through
+   * `onRefused`, so the caller can stop tracking them. The connection is
+   * fine, so the subscriber stays healthy.
+   *
+   * Any other failure on a live connection leaves the subscriber without
+   * those channels, so it is marked unhealthy for the next reset to replace
+   * it. `onFailed` is called once, so the caller can schedule that reset.
+   * `onSucceeded` is called when no slot failed that way.
+   */
+  subscribe(
+    channelsBySlot: Array<Array<string | Buffer>>,
+    handlers: {
+      onSucceeded: () => void;
+      onFailed: (error: Error) => void;
+      onRefused: (channels: Array<string | Buffer>, error: Error) => void;
+    },
+  ): void {
+    const redis = this.instance;
+
+    if (!redis || redis.status === "end") {
+      return;
+    }
+
+    const subscribeChannels = (
+      channels: Array<string | Buffer>,
+    ): Promise<void> =>
+      redis.ssubscribe(...channels).then(
+        () => undefined,
+        (err) => {
+          if (!isRefusal(err)) {
+            throw err;
+          }
+
+          // The server refuses the whole command for one bad channel, so
+          // retry the channels one by one to keep the ones it accepts.
+          if (channels.length > 1) {
+            return Promise.all(
+              channels.map((channel) => subscribeChannels([channel])),
+            ).then(() => undefined);
+          }
+
+          debug("ssubscribe refused on node %s: %s", this.nodeKey, err);
+          handlers.onRefused(channels, err);
+        },
+      );
+
+    const send = () => {
+      Promise.all(channelsBySlot.map(subscribeChannels)).then(
+        () => {
+          if (this.instance === redis && !this.subscribeFailed) {
+            handlers.onSucceeded();
+          }
+        },
+        (err) => {
+          debug("Failed to ssubscribe on node %s: %s", this.nodeKey, err);
+
+          // A stopped subscriber or a closed connection is already replaced.
+          if (
+            this.instance !== redis ||
+            redis.status !== "ready" ||
+            this.subscribeFailed
+          ) {
+            return;
+          }
+
+          this.subscribeFailed = true;
+          handlers.onFailed(err);
+        },
+      );
+    };
+
+    if (redis.status === "ready") {
+      send();
+    } else {
+      redis.once("ready", send);
+    }
+  }
+
   isStarted(): boolean {
     return (
       [
@@ -180,7 +284,8 @@ export default class ShardedSubscriber {
       (this.status === SubscriberStatus.IDLE ||
         this.status === SubscriberStatus.CONNECTED ||
         this.status === SubscriberStatus.STARTING) &&
-      this.instance !== null
+      this.instance !== null &&
+      !this.subscribeFailed
     );
   }
 
@@ -197,8 +302,11 @@ export default class ShardedSubscriber {
   }
 
   private onEnd = () => {
+    // A subscriber that never connected is retried by the failed start, after
+    // a backoff. Only a lost connection needs to be replaced right away.
+    const wasConnected = this.status === SubscriberStatus.CONNECTED;
     this.updateStatus(SubscriberStatus.ENDED);
-    this.emitter.emit("-node", this.instance, this.nodeKey);
+    this.emitter.emit("-node", this.instance, this.nodeKey, wasConnected);
   };
 
   private onError = (error: Error) => {

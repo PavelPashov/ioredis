@@ -1,6 +1,6 @@
 import { exists, hasFlag } from "@ioredis/commands";
 import { EventEmitter } from "events";
-import { AbortError, RedisError } from "redis-errors";
+import { AbortError, RedisError, ReplyError } from "redis-errors";
 import asCallback from "standard-as-callback";
 import Command from "../Command";
 import ClusterAllFailedError from "../errors/ClusterAllFailedError";
@@ -793,7 +793,19 @@ class Cluster<
             let status = -1;
 
             if (command.name == "ssubscribe") {
-              status = _this.shardedSubscribers.addChannels(command.getKeys());
+              const channels = command.getKeys();
+              status = _this.shardedSubscribers.addChannels(channels);
+
+              if (status !== -1) {
+                // The channels are tracked before the reply. Stop tracking
+                // the ones the server refused (e.g. NOPERM), or every
+                // resubscribe would fail on them and replace the subscriber.
+                command.promise.catch((err) => {
+                  if (err instanceof ReplyError) {
+                    _this.shardedSubscribers.removeChannels(channels);
+                  }
+                });
+              }
             }
 
             if (command.name == "sunsubscribe") {
@@ -1458,16 +1470,21 @@ class Cluster<
     // become zombied. For sharded subscribers, a ClusterAllFailedError means
     // we have lost all nodes from the subscriber perspective and must tear down.
     const refreshSlotsCacheCallback = (err?: Error) => {
-      // Disconnect only when refreshing the slots cache fails with ClusterAllFailedError
-      if (err instanceof ClusterAllFailedError) {
+      // Disconnect only when refreshing the slots cache fails with ClusterAllFailedError.
+      // A refresh scheduled before a disconnect can fire while the cluster is
+      // reconnecting. The pool is empty then, so the refresh fails at once, and
+      // disconnecting again would abort the reconnect in progress.
+      if (err instanceof ClusterAllFailedError && this.status === "ready") {
         this.disconnect(true);
       }
     };
 
-    this.subscriberGroupEmitter.on("-node", (redis, nodeKey) => {
+    this.subscriberGroupEmitter.on("-node", (redis, nodeKey, wasConnected) => {
       this.emit("-node", redis, nodeKey);
 
-      this.refreshSlotsCache(refreshSlotsCacheCallback);
+      if (wasConnected) {
+        this.refreshSlotsCache(refreshSlotsCacheCallback);
+      }
     });
 
     this.subscriberGroupEmitter.on(
@@ -1480,6 +1497,10 @@ class Cluster<
         }, delay);
       }
     );
+
+    this.subscriberGroupEmitter.on("subscribeRefused", (error) => {
+      Redis.prototype.silentEmit.call(this, "error", error);
+    });
 
     this.subscriberGroupEmitter.on("moved", () => {
       this.refreshSlotsCache(refreshSlotsCacheCallback);

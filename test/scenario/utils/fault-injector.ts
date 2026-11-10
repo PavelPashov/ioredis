@@ -278,21 +278,38 @@ export class FaultInjectorClient {
 
     const startTime = Date.now();
 
-    while (Date.now() - startTime < maxWaitTime) {
-      const action = await this.getActionStatus<ActionStatus>(actionId);
+    let lastNetworkError: TypeError | undefined;
 
-      if (action.status === "failed") {
+    while (Date.now() - startTime < maxWaitTime) {
+      let action: ActionStatus | undefined;
+
+      try {
+        action = await this.getActionStatus<ActionStatus>(actionId);
+      } catch (error) {
+        // fetch rejects with a TypeError when the request never gets a
+        // response. The fault injector can drop a poll while the fault it
+        // triggered is in progress, so keep polling until the deadline.
+        if (!(error instanceof TypeError)) {
+          throw error;
+        }
+        lastNetworkError = error;
+      }
+
+      if (action?.status === "failed") {
         throw new Error(
           `Action id: ${actionId} failed! Error: ${action.error}`
         );
-      } else if (["finished", "success"].includes(action.status)) {
+      } else if (action && ["finished", "success"].includes(action.status)) {
         return action;
       }
 
       await wait(timeout);
     }
 
-    throw new Error(`Timeout waiting for action ${actionId}`);
+    throw new Error(
+      `Timeout waiting for action ${actionId}` +
+        (lastNetworkError ? `. Last network error: ${lastNetworkError.message}` : "")
+    );
   }
 
   async createDatabase(

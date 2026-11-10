@@ -58,7 +58,7 @@ export default class ClusterSubscriberGroup {
           this.handleSubscriberConnectSucceeded(sub);
         })
         .catch((err) => {
-          this.handleSubscriberConnectFailed(err, sub.getNodeKey());
+          this.handleSubscriberFailed(err, sub.getNodeKey());
         });
     }
 
@@ -205,7 +205,7 @@ export default class ClusterSubscriberGroup {
               this.handleSubscriberConnectSucceeded(s);
             })
             .catch((err) => {
-              this.handleSubscriberConnectFailed(err, s.getNodeKey());
+              this.handleSubscriberFailed(err, s.getNodeKey());
             }),
         );
 
@@ -277,7 +277,7 @@ export default class ClusterSubscriberGroup {
                   this.handleSubscriberConnectSucceeded(existingSubscriber);
                 })
                 .catch((error) => {
-                  this.handleSubscriberConnectFailed(error, nodeKey);
+                  this.handleSubscriberFailed(error, nodeKey);
                 }),
             );
           }
@@ -321,7 +321,7 @@ export default class ClusterSubscriberGroup {
                 this.handleSubscriberConnectSucceeded(sub);
               })
               .catch((error) => {
-                this.handleSubscriberConnectFailed(error, nodeKey);
+                this.handleSubscriberFailed(error, nodeKey);
               }),
           );
         }
@@ -390,45 +390,32 @@ export default class ClusterSubscriberGroup {
    * @private
    */
   private _resubscribe() {
-    if (this.shardedSubscribers) {
-      this.shardedSubscribers.forEach(
-        (s: ShardedSubscriber, nodeKey: string) => {
-          const subscriberSlots = this.subscriberToSlotsIndex.get(nodeKey);
-          if (subscriberSlots) {
-            //Resubscribe on the underlying connection
-            subscriberSlots.forEach((ss) => {
-              //Might return null if being disconnected
-              const redis = s.getInstance();
-              const channels = this.channels.get(ss);
+    this.shardedSubscribers.forEach((s: ShardedSubscriber, nodeKey: string) => {
+      const subscriberSlots = this.subscriberToSlotsIndex.get(nodeKey) ?? [];
+      const channelsBySlot = subscriberSlots
+        .map((slot) => this.channels.get(slot))
+        .filter((channels) => channels && channels.length > 0);
 
-              if (channels && channels.length > 0) {
-                if (!redis || redis.status === "end") {
-                  return;
-                }
+      if (channelsBySlot.length === 0) {
+        return;
+      }
 
-                if (redis.status === "ready") {
-                  redis.ssubscribe(...channels).catch((err) => {
-                    // TODO: Should we emit an error event here?
-                    debug("Failed to ssubscribe on node %s: %s", nodeKey, err);
-                  });
-                } else {
-                  redis.once("ready", () => {
-                    redis.ssubscribe(...channels).catch((err) => {
-                      // TODO: Should we emit an error event here?
-                      debug(
-                        "Failed to ssubscribe on node %s: %s",
-                        nodeKey,
-                        err,
-                      );
-                    });
-                  });
-                }
-              }
-            });
-          }
+      //Resubscribe on the underlying connection
+      s.subscribe(channelsBySlot, {
+        onSucceeded: () => {
+          this.failedAttemptsByNode.delete(nodeKey);
         },
-      );
-    }
+        onFailed: (err) => {
+          this.handleSubscriberFailed(err, nodeKey);
+        },
+        // Stop tracking channels the server refused, or every resubscribe
+        // would fail on them.
+        onRefused: (channels, error) => {
+          this.removeChannels(channels);
+          this.subscriberGroupEmitter.emit("subscribeRefused", error);
+        },
+      });
+    });
   }
 
   /**
@@ -467,13 +454,13 @@ export default class ClusterSubscriberGroup {
   }
 
   /**
-   * Handles failed subscriber connections by emitting an event to refresh the slots cache
-   * after a backoff period.
+   * Handles a subscriber that failed to connect or to resubscribe by emitting an event
+   * to refresh the slots cache after a backoff period. That refresh replaces the subscriber.
    *
    * @param error
    * @param nodeKey
    */
-  private handleSubscriberConnectFailed = (error: Error, nodeKey: string) => {
+  private handleSubscriberFailed = (error: Error, nodeKey: string) => {
     const currentAttempts = this.failedAttemptsByNode.get(nodeKey) || 0;
     const failedAttempts = currentAttempts + 1;
     this.failedAttemptsByNode.set(nodeKey, failedAttempts);
@@ -490,8 +477,9 @@ export default class ClusterSubscriberGroup {
     const delay = Math.max(0, backoff + jitter);
 
     debug(
-      "Failed to connect subscriber for %s. Refreshing slots in %dms",
+      "Subscriber for %s failed: %s. Refreshing slots in %dms",
       nodeKey,
+      error,
       delay,
     );
 
@@ -505,10 +493,17 @@ export default class ClusterSubscriberGroup {
    * Handles successful subscriber connections by resetting the failed attempts counter.
    * A start that stop() cut short also settles, but it never connected.
    *
+   * A subscriber with channels has not recovered until it resubscribed, so
+   * its counter is reset by the resubscribe instead. Otherwise a resubscribe
+   * that keeps failing on a healthy connection would never back off.
+   *
    * @param sub
    */
   private handleSubscriberConnectSucceeded = (sub: ShardedSubscriber) => {
-    if (sub.subscriberStatus === "connected") {
+    if (
+      sub.subscriberStatus === "connected" &&
+      !this.hasSubscribedChannels(sub.getNodeKey())
+    ) {
       this.failedAttemptsByNode.delete(sub.getNodeKey());
     }
   };
