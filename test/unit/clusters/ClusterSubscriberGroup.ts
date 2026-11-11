@@ -35,19 +35,61 @@ describe("ClusterSubscriberGroup", () => {
   });
 
   describe("connect backoff", () => {
-    afterEach(() => {
-      sinon.restore();
+    let clock: sinon.SinonFakeTimers;
+    const realSetImmediate = setImmediate;
+    const flushPromises = () =>
+      new Promise((resolve) => realSetImmediate(resolve));
+
+    beforeEach(() => {
+      clock = sinon.useFakeTimers();
     });
 
-    it("keeps growing when a start is cut short by stop", async () => {
-      const connect = sinon.stub(Redis.prototype, "connect");
-      connect.onCall(0).rejects(new Error("connect failed"));
-      connect.onCall(1).returns(new Promise<void>(() => {}));
-      connect.onCall(2).rejects(new Error("connect failed"));
+    afterEach(() => {
+      sinon.restore();
+      clock.restore();
+    });
+
+    it("keeps growing when the group is stopped between failed starts", async () => {
+      sinon
+        .stub(Redis.prototype, "connect")
+        .rejects(new Error("connect failed"));
+      sinon.stub(Redis.prototype, "ssubscribe").rejects(new Error("closed"));
 
       const emitter = new EventEmitter();
-      const delays: number[] = [];
-      emitter.on("subscriberConnectFailed", ({ delay }) => delays.push(delay));
+      const refreshSlots = sinon.spy();
+      emitter.on("refreshSlots", refreshSlots);
+      emitter.on("subscriberError", () => {});
+
+      const group = new ClusterSubscriberGroup(emitter, {});
+      group.addChannels(["news{tag}"]);
+      const slots = new Array(16384).fill(["127.0.0.1:30001"]);
+      const nodes = [{ options: { host: "127.0.0.1", port: 30001 } }];
+
+      // First failure backs off for 200ms, give or take 50ms.
+      await group.reset(slots, nodes);
+      await flushPromises();
+      clock.tick(250);
+      expect(refreshSlots.callCount, "first retry").to.equal(1);
+
+      group.stop();
+
+      // Second failure backs off for 400ms, give or take 100ms.
+      await group.reset(slots, nodes);
+      await flushPromises();
+      clock.tick(299);
+      expect(refreshSlots.callCount, "second retry came early").to.equal(1);
+      clock.tick(201);
+      expect(refreshSlots.callCount, "second retry").to.equal(2);
+    });
+
+    it("leaves a node alone while it backs off", async () => {
+      const connect = sinon
+        .stub(Redis.prototype, "connect")
+        .rejects(new Error("connect failed"));
+      sinon.stub(Redis.prototype, "ssubscribe").rejects(new Error("closed"));
+
+      const emitter = new EventEmitter();
+      emitter.on("subscriberError", () => {});
 
       const group = new ClusterSubscriberGroup(emitter, {});
       group.addChannels(["news{tag}"]);
@@ -55,18 +97,17 @@ describe("ClusterSubscriberGroup", () => {
       const nodes = [{ options: { host: "127.0.0.1", port: 30001 } }];
 
       await group.reset(slots, nodes);
-      expect(delays, "first failure").to.have.length(1);
-
-      const hungReset = group.reset(slots, nodes);
-      await new Promise((resolve) => setImmediate(resolve));
-      expect(connect.callCount, "second start is pending").to.equal(2);
-      group.stop();
-      await hungReset;
-
+      await flushPromises();
       await group.reset(slots, nodes);
-      expect(connect.callCount, "third start ran").to.equal(3);
-      expect(delays, "second failure").to.have.length(2);
-      expect(delays[1], "second backoff step").to.be.at.least(300);
+      await flushPromises();
+      expect(connect.callCount, "reconnected during the backoff").to.equal(1);
+
+      clock.tick(250);
+      await group.reset(slots, nodes);
+      await flushPromises();
+      expect(connect.callCount, "reconnected after the backoff").to.equal(2);
+
+      group.stop();
     });
   });
 });

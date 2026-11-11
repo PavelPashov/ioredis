@@ -4,7 +4,36 @@ import * as calculateSlot from "../utils/calculateSlot";
 import * as EventEmitter from "events";
 import ShardedSubscriber from "./ShardedSubscriber";
 import { ClusterOptions } from "./ClusterOptions";
+import { ReplyError } from "redis-errors";
 const debug = Debug("cluster:subscriberGroup");
+
+type Channels = Array<string | Buffer>;
+
+// Error replies that pass once the cluster settles. A retry can succeed.
+const TRANSIENT_REPLY_ERRORS = [
+  "MOVED",
+  "ASK",
+  "CLUSTERDOWN",
+  "TRYAGAIN",
+  "LOADING",
+];
+
+/**
+ * Whether the server refused the command for good (e.g. NOPERM), so a retry
+ * would get the same reply.
+ */
+function isRefusal(error: Error): boolean {
+  return (
+    error instanceof ReplyError &&
+    !TRANSIENT_REPLY_ERRORS.some((prefix) => error.message.startsWith(prefix))
+  );
+}
+
+function isSameChannel(a: string | Buffer, b: string | Buffer): boolean {
+  return typeof a === "string" && typeof b === "string"
+    ? a === b
+    : Buffer.from(a).equals(Buffer.from(b));
+}
 
 /**
  * Redis distinguishes between "normal" and sharded PubSub. When using the normal PubSub feature,
@@ -14,6 +43,17 @@ const debug = Debug("cluster:subscriberGroup");
  *
  * This class coordinates one ShardedSubscriber per master node in the cluster, providing
  * sharded PubSub support while keeping the public API backward compatible.
+ *
+ * `channels` is the wanted state. Every reset() moves the subscribers towards
+ * it. A subscriber is one connection and is never reused, so each failure
+ * gets one of three reactions:
+ *
+ * - The connection closed: the next reset replaces the subscriber and
+ *   subscribes the new one to the node's channels.
+ * - The server refused a channel for good: the channel is no longer wanted.
+ *   The connection stays.
+ * - A connect or a subscribe failed in a way a retry can fix: the node backs
+ *   off. Resets leave it alone until the backoff ends, then retry it.
  */
 export default class ClusterSubscriberGroup {
   private shardedSubscribers: Map<string, ShardedSubscriber> = new Map();
@@ -22,10 +62,8 @@ export default class ClusterSubscriberGroup {
   private subscriberToSlotsIndex: Map<string, number[]> = new Map();
   private channels: Map<number, Array<string | Buffer>> = new Map();
   private failedAttemptsByNode: Map<string, number> = new Map();
-
-  // Only latest pending reset kept; throttled by refreshSlotsCache's isRefreshing + backoff delay
-  private isResetting = false;
-  private pendingReset: { slots: string[][]; nodes: any[] } | null = null;
+  // Nodes that are backing off, with the timer that ends the backoff.
+  private retryTimers: Map<string, NodeJS.Timeout> = new Map();
 
   // Retry strategy
   private static readonly MAX_RETRY_ATTEMPTS = 10;
@@ -39,7 +77,7 @@ export default class ClusterSubscriberGroup {
    */
   constructor(
     private readonly subscriberGroupEmitter: EventEmitter,
-    private readonly options: ClusterOptions,
+    private readonly options: ClusterOptions
   ) {}
 
   /**
@@ -52,14 +90,7 @@ export default class ClusterSubscriberGroup {
     const sub = this.shardedSubscribers.get(nodeKey);
 
     if (sub && sub.subscriberStatus === "idle") {
-      sub
-        .start()
-        .then(() => {
-          this.handleSubscriberConnectSucceeded(sub);
-        })
-        .catch((err) => {
-          this.handleSubscriberFailed(err, sub.getNodeKey());
-        });
+      this.startSubscriber(sub);
     }
 
     return sub;
@@ -80,17 +111,21 @@ export default class ClusterSubscriberGroup {
       }
     }
 
-    const currChannels = this.channels.get(slot);
+    // A channel is tracked once, however often it is subscribed. The cluster
+    // can send the same SSUBSCRIBE again when it retries a command.
+    const slotChannels = [...(this.channels.get(slot) ?? [])];
 
-    if (!currChannels) {
-      this.channels.set(slot, channels);
-    } else {
-      this.channels.set(slot, currChannels.concat(channels));
+    for (const channel of channels) {
+      if (!slotChannels.some((c) => isSameChannel(c, channel))) {
+        slotChannels.push(channel);
+      }
     }
+
+    this.channels.set(slot, slotChannels);
 
     return Array.from(this.channels.values()).reduce(
       (sum, array) => sum + array.length,
-      0,
+      0
     );
   }
 
@@ -112,19 +147,14 @@ export default class ClusterSubscriberGroup {
 
     if (slotChannels) {
       const updatedChannels = slotChannels.filter(
-        (c) =>
-          !channels.some((channel) =>
-            typeof c === "string" && typeof channel === "string"
-              ? c === channel
-              : Buffer.from(c).equals(Buffer.from(channel)),
-          ),
+        (c) => !channels.some((channel) => isSameChannel(c, channel))
       );
       this.channels.set(slot, updatedChannels);
     }
 
     return Array.from(this.channels.values()).reduce(
       (sum, array) => sum + array.length,
-      0,
+      0
     );
   }
 
@@ -167,7 +197,7 @@ export default class ClusterSubscriberGroup {
     if (failed.length > 0) {
       // Keep the tracked channels so a retry (SUNSUBSCRIBE is idempotent) still targets these shards.
       throw new Error(
-        `SUNSUBSCRIBE failed on ${failed.map((p) => p.nodeKey).join(", ")}`,
+        `SUNSUBSCRIBE failed on ${failed.map((p) => p.nodeKey).join(", ")}`
       );
     }
 
@@ -184,9 +214,14 @@ export default class ClusterSubscriberGroup {
       s.stop();
     }
 
-    // Clear subscriber instances and pending operations.
-    // Channels are preserved for resubscription on reconnect.
-    this.pendingReset = null;
+    for (const timer of this.retryTimers.values()) {
+      clearTimeout(timer);
+    }
+
+    // Clear subscriber instances and pending retries.
+    // Channels are preserved for resubscription on reconnect, and the failed
+    // attempts so the backoff keeps growing across reconnects.
+    this.retryTimers.clear();
     this.shardedSubscribers.clear();
     this.subscriberToSlotsIndex.clear();
   }
@@ -198,16 +233,7 @@ export default class ClusterSubscriberGroup {
     const startPromises = [];
     for (const s of this.shardedSubscribers.values()) {
       if (this.shouldStartSubscriber(s)) {
-        startPromises.push(
-          s
-            .start()
-            .then(() => {
-              this.handleSubscriberConnectSucceeded(s);
-            })
-            .catch((err) => {
-              this.handleSubscriberFailed(err, s.getNodeKey());
-            }),
-        );
+        startPromises.push(this.startSubscriber(s));
 
         this.subscriberGroupEmitter.emit("+subscriber");
       }
@@ -216,85 +242,51 @@ export default class ClusterSubscriberGroup {
   }
 
   /**
-   * Resets the subscriber group by disconnecting all subscribers that are no longer needed and connecting new ones.
+   * Moves the subscribers towards the given topology: stops the ones that
+   * are closed or no longer own slots, creates the missing ones, and
+   * subscribes each to the channels it should hold.
+   *
+   * Nothing here waits on the network. A subscribe sent before the
+   * connection is ready waits in the connection's offline queue, so a
+   * connect that hangs only affects its own node.
    */
   async reset(clusterSlots: string[][], clusterNodes: any[]): Promise<void> {
-    if (this.isResetting) {
-      this.pendingReset = { slots: clusterSlots, nodes: clusterNodes };
-      return;
+    const hasTopologyChanged = this._refreshSlots(clusterSlots);
+    let hasChanged = hasTopologyChanged;
+
+    for (const [nodeKey, shardedSubscriber] of this.shardedSubscribers) {
+      const ownsSlots = this.subscriberToSlotsIndex.has(nodeKey);
+
+      if (ownsSlots && this.retryTimers.has(nodeKey)) {
+        continue;
+      }
+
+      if (ownsSlots && shardedSubscriber.isHealthy()) {
+        continue;
+      }
+
+      debug("Removing subscriber for %s", nodeKey);
+      shardedSubscriber.stop();
+      this.shardedSubscribers.delete(nodeKey);
+      this.subscriberGroupEmitter.emit("-subscriber");
+      hasChanged = true;
+
+      if (!ownsSlots) {
+        this.clearRetry(nodeKey);
+      }
     }
 
-    this.isResetting = true;
+    const startPromises = [];
 
-    try {
-      const hasTopologyChanged = this._refreshSlots(clusterSlots);
-      const hasFailedSubscribers = this.hasUnhealthySubscribers();
-
-      if (!hasTopologyChanged && !hasFailedSubscribers) {
-        debug(
-          "No topology change detected or failed subscribers. Skipping reset.",
-        );
-        return;
+    for (const nodeKey of this.subscriberToSlotsIndex.keys()) {
+      if (this.retryTimers.has(nodeKey)) {
+        continue;
       }
 
-      // For each of the sharded subscribers
-      for (const [nodeKey, shardedSubscriber] of this.shardedSubscribers) {
-        if (
-          // If the subscriber is still responsible for a slot range and is healthy then keep it
-          this.subscriberToSlotsIndex.has(nodeKey) &&
-          shardedSubscriber.isHealthy()
-        ) {
-          debug("Skipping deleting subscriber for %s", nodeKey);
-          continue;
-        }
+      let sub = this.shardedSubscribers.get(nodeKey);
+      const isNew = !sub;
 
-        debug("Removing subscriber for %s", nodeKey);
-        // Otherwise stop the subscriber and remove it
-        shardedSubscriber.stop();
-        this.shardedSubscribers.delete(nodeKey);
-
-        this.subscriberGroupEmitter.emit("-subscriber");
-      }
-
-      const startPromises = [];
-      // For each node in slots cache
-      for (const [nodeKey, _] of this.subscriberToSlotsIndex) {
-        const existingSubscriber = this.shardedSubscribers.get(nodeKey);
-
-        // If we already have a subscriber for this node, only ensure it is healthy
-        // when it now owns slots with active channel subscriptions.
-        if (existingSubscriber && existingSubscriber.isHealthy()) {
-          debug("Skipping creating new subscriber for %s", nodeKey);
-
-          if (
-            !existingSubscriber.isStarted() &&
-            this.shouldStartSubscriber(existingSubscriber)
-          ) {
-            startPromises.push(
-              existingSubscriber
-                .start()
-                .then(() => {
-                  this.handleSubscriberConnectSucceeded(existingSubscriber);
-                })
-                .catch((error) => {
-                  this.handleSubscriberFailed(error, nodeKey);
-                }),
-            );
-          }
-
-          continue;
-        }
-
-        // If we have an existing subscriber but it is not healthy, stop it
-        if (existingSubscriber && !existingSubscriber.isHealthy()) {
-          debug("Replacing subscriber for %s", nodeKey);
-          existingSubscriber.stop();
-          this.shardedSubscribers.delete(nodeKey);
-          this.subscriberGroupEmitter.emit("-subscriber");
-        }
-
-        debug("Creating new subscriber for %s", nodeKey);
-        // Otherwise create a new subscriber
+      if (!sub) {
         const redis = clusterNodes.find((node) => {
           return getNodeKey(node.options) === nodeKey;
         });
@@ -304,46 +296,105 @@ export default class ClusterSubscriberGroup {
           continue;
         }
 
-        const sub = new ShardedSubscriber(
+        debug("Creating new subscriber for %s", nodeKey);
+        sub = new ShardedSubscriber(
           this.subscriberGroupEmitter,
           redis.options,
           this.options.redisOptions,
-          this.options.shardedSubscriberHealthCheckInterval,
+          this.options.shardedSubscriberHealthCheckInterval
         );
 
         this.shardedSubscribers.set(nodeKey, sub);
-
-        if (this.shouldStartSubscriber(sub)) {
-          startPromises.push(
-            sub
-              .start()
-              .then(() => {
-                this.handleSubscriberConnectSucceeded(sub);
-              })
-              .catch((error) => {
-                this.handleSubscriberFailed(error, nodeKey);
-              }),
-          );
-        }
-
         this.subscriberGroupEmitter.emit("+subscriber");
       }
 
-      // It's vital to await the start promises before resubscribing
-      // Otherwise we might try to resubscribe to a subscriber that is not yet connected
-      // This can cause a race condition
-      await Promise.all(startPromises);
+      if (this.shouldStartSubscriber(sub)) {
+        startPromises.push(this.startSubscriber(sub));
+      }
 
-      this._resubscribe();
-      this.subscriberGroupEmitter.emit("subscribersReady");
-    } finally {
-      this.isResetting = false;
-      if (this.pendingReset) {
-        const { slots, nodes } = this.pendingReset;
-        this.pendingReset = null;
-        await this.reset(slots, nodes);
+      // A new subscriber holds no channels, a topology change can move
+      // channels between nodes, and a node whose backoff ended has a failed
+      // subscribe to retry.
+      const isRetryDue = this.failedAttemptsByNode.has(nodeKey);
+
+      if (isNew || hasTopologyChanged || isRetryDue) {
+        this.resubscribe(nodeKey);
+        hasChanged = true;
       }
     }
+
+    if (hasChanged) {
+      Promise.all(startPromises).then(() => {
+        this.subscriberGroupEmitter.emit("subscribersReady");
+      });
+    }
+  }
+
+  /**
+   * Tracks the reply to an SSUBSCRIBE that `sub` sent for `channels`, and
+   * reacts to a failure. Both a user's SSUBSCRIBE and a resubscribe go
+   * through here.
+   *
+   * A user's command also rejects the user's promise. A resubscribe has no
+   * caller, so its errors are emitted instead.
+   *
+   * Resolves to whether the channels need no further attempt.
+   */
+  watchSubscribe(
+    sub: ShardedSubscriber,
+    channels: Channels,
+    reply: Promise<unknown>,
+    isResubscribe = false
+  ): Promise<boolean> {
+    const nodeKey = sub.getNodeKey();
+    const redis = sub.getInstance();
+
+    return reply.then(
+      () => true,
+      (error: Error) => {
+        if (isRefusal(error)) {
+          // The server refuses the whole command for one bad channel, so
+          // retry the channels one by one to keep the ones it accepts.
+          if (isResubscribe && channels.length > 1) {
+            return Promise.all(
+              channels.map((channel) => this.subscribe(sub, [channel]))
+            ).then((results) => results.every(Boolean));
+          }
+
+          debug("ssubscribe refused on node %s: %s", nodeKey, error);
+          this.removeChannels(channels);
+
+          if (isResubscribe) {
+            this.subscriberGroupEmitter.emit("subscriberError", error);
+          }
+
+          return true;
+        }
+
+        // A closed connection is replaced by the reset its "end" triggers.
+        if (!redis || sub.getInstance() !== redis || redis.status !== "ready") {
+          return false;
+        }
+
+        debug("Failed to ssubscribe on node %s: %s", nodeKey, error);
+
+        if (isResubscribe) {
+          this.subscriberGroupEmitter.emit("subscriberError", error);
+        }
+
+        this.scheduleRetry(nodeKey);
+
+        // A resubscribe that got no reply (e.g. a command timeout) ran on a
+        // connection that cannot be trusted. Close it so it is replaced once
+        // the backoff ends. A user's command can also fail in the cluster
+        // layer, on a healthy connection, so its channels are only retried.
+        if (isResubscribe && !(error instanceof ReplyError)) {
+          redis.disconnect();
+        }
+
+        return false;
+      }
+    );
   }
 
   /**
@@ -356,9 +407,12 @@ export default class ClusterSubscriberGroup {
   private _refreshSlots(targetSlots: string[][]): boolean {
     //If there was an actual change, then reassign the slot ranges
     // Also rebuild if subscriberToSlotsIndex is empty (e.g., after stop() was called)
-    if (this._slotsAreEqual(targetSlots) && this.subscriberToSlotsIndex.size > 0) {
+    if (
+      this._slotsAreEqual(targetSlots) &&
+      this.subscriberToSlotsIndex.size > 0
+    ) {
       debug(
-        "Nothing to refresh because the new cluster map is equal to the previous one.",
+        "Nothing to refresh because the new cluster map is equal to the previous one."
       );
 
       return false;
@@ -385,37 +439,46 @@ export default class ClusterSubscriberGroup {
   }
 
   /**
-   * Resubscribes to the previous channels
-   *
-   * @private
+   * Subscribes the subscriber of `nodeKey` to the channels of its slots.
+   * The node has recovered once every subscribe succeeded.
    */
-  private _resubscribe() {
-    this.shardedSubscribers.forEach((s: ShardedSubscriber, nodeKey: string) => {
-      const subscriberSlots = this.subscriberToSlotsIndex.get(nodeKey) ?? [];
-      const channelsBySlot = subscriberSlots
-        .map((slot) => this.channels.get(slot))
-        .filter((channels) => channels && channels.length > 0);
+  private resubscribe(nodeKey: string) {
+    const sub = this.shardedSubscribers.get(nodeKey);
 
-      if (channelsBySlot.length === 0) {
-        return;
+    if (!sub || !sub.isStarted()) {
+      return;
+    }
+
+    const subscriberSlots = this.subscriberToSlotsIndex.get(nodeKey) ?? [];
+    const results = subscriberSlots
+      .map((slot) => this.channels.get(slot))
+      .filter((channels) => channels && channels.length > 0)
+      .map((channels) => this.subscribe(sub, channels));
+
+    Promise.all(results).then((succeeded) => {
+      if (
+        succeeded.every(Boolean) &&
+        this.shardedSubscribers.get(nodeKey) === sub &&
+        !this.retryTimers.has(nodeKey)
+      ) {
+        this.failedAttemptsByNode.delete(nodeKey);
       }
-
-      //Resubscribe on the underlying connection
-      s.subscribe(channelsBySlot, {
-        onSucceeded: () => {
-          this.failedAttemptsByNode.delete(nodeKey);
-        },
-        onFailed: (err) => {
-          this.handleSubscriberFailed(err, nodeKey);
-        },
-        // Stop tracking channels the server refused, or every resubscribe
-        // would fail on them.
-        onRefused: (channels, error) => {
-          this.removeChannels(channels);
-          this.subscriberGroupEmitter.emit("subscribeRefused", error);
-        },
-      });
     });
+  }
+
+  private subscribe(sub: ShardedSubscriber, channels: Channels) {
+    const redis = sub.getInstance();
+
+    if (!redis) {
+      return Promise.resolve(false);
+    }
+
+    return this.watchSubscribe(
+      sub,
+      channels,
+      redis.ssubscribe(...channels),
+      true
+    );
   }
 
   /**
@@ -433,80 +496,70 @@ export default class ClusterSubscriberGroup {
   }
 
   /**
-   * Checks if any subscribers are in an unhealthy state.
-   *
-   * A subscriber is considered unhealthy if:
-   * - It exists but is not started (failed/disconnected)
-   * - It's missing entirely for a node that should have one
-   *
-   * @returns true if any subscribers need to be recreated
+   * Starts a subscriber. A failed connect is reported and retried after a
+   * backoff.
    */
-  private hasUnhealthySubscribers(): boolean {
-    const hasFailedSubscribers = Array.from(
-      this.shardedSubscribers.values(),
-    ).some((sub) => !sub.isHealthy());
+  private startSubscriber(sub: ShardedSubscriber): Promise<void> {
+    const nodeKey = sub.getNodeKey();
 
-    const hasMissingSubscribers = Array.from(
-      this.subscriberToSlotsIndex.keys(),
-    ).some((nodeKey) => !this.shardedSubscribers.has(nodeKey));
-
-    return hasFailedSubscribers || hasMissingSubscribers;
+    return sub.start().then(
+      () => {
+        // A start resolves too when stop() cut it short, without connecting.
+        // A node with channels has recovered once it resubscribed.
+        if (
+          sub.subscriberStatus === "connected" &&
+          !this.hasSubscribedChannels(nodeKey)
+        ) {
+          this.failedAttemptsByNode.delete(nodeKey);
+        }
+      },
+      (error) => {
+        this.subscriberGroupEmitter.emit("subscriberError", error);
+        this.scheduleRetry(nodeKey);
+      }
+    );
   }
 
   /**
-   * Handles a subscriber that failed to connect or to resubscribe by emitting an event
-   * to refresh the slots cache after a backoff period. That refresh replaces the subscriber.
-   *
-   * @param error
-   * @param nodeKey
+   * Puts a node in backoff. Resets leave the node alone until the backoff
+   * ends. Then a slots refresh is requested, and the reset that follows
+   * replaces the subscriber if it is closed, or resubscribes it.
    */
-  private handleSubscriberFailed = (error: Error, nodeKey: string) => {
-    const currentAttempts = this.failedAttemptsByNode.get(nodeKey) || 0;
-    const failedAttempts = currentAttempts + 1;
+  private scheduleRetry(nodeKey: string) {
+    if (this.retryTimers.has(nodeKey)) {
+      return;
+    }
+
+    const failedAttempts = (this.failedAttemptsByNode.get(nodeKey) || 0) + 1;
     this.failedAttemptsByNode.set(nodeKey, failedAttempts);
 
     const attempts = Math.min(
       failedAttempts,
-      ClusterSubscriberGroup.MAX_RETRY_ATTEMPTS,
+      ClusterSubscriberGroup.MAX_RETRY_ATTEMPTS
     );
     const backoff = Math.min(
       ClusterSubscriberGroup.BASE_BACKOFF_MS * 2 ** attempts,
-      ClusterSubscriberGroup.MAX_BACKOFF_MS,
+      ClusterSubscriberGroup.MAX_BACKOFF_MS
     );
     const jitter = Math.floor((Math.random() - 0.5) * (backoff * 0.5));
     const delay = Math.max(0, backoff + jitter);
 
-    debug(
-      "Subscriber for %s failed: %s. Refreshing slots in %dms",
+    debug("Subscriber for %s failed. Retrying in %dms", nodeKey, delay);
+
+    this.retryTimers.set(
       nodeKey,
-      error,
-      delay,
+      setTimeout(() => {
+        this.retryTimers.delete(nodeKey);
+        this.subscriberGroupEmitter.emit("refreshSlots");
+      }, delay)
     );
+  }
 
-    this.subscriberGroupEmitter.emit("subscriberConnectFailed", {
-      delay,
-      error,
-    });
-  };
-
-  /**
-   * Handles successful subscriber connections by resetting the failed attempts counter.
-   * A start that stop() cut short also settles, but it never connected.
-   *
-   * A subscriber with channels has not recovered until it resubscribed, so
-   * its counter is reset by the resubscribe instead. Otherwise a resubscribe
-   * that keeps failing on a healthy connection would never back off.
-   *
-   * @param sub
-   */
-  private handleSubscriberConnectSucceeded = (sub: ShardedSubscriber) => {
-    if (
-      sub.subscriberStatus === "connected" &&
-      !this.hasSubscribedChannels(sub.getNodeKey())
-    ) {
-      this.failedAttemptsByNode.delete(sub.getNodeKey());
-    }
-  };
+  private clearRetry(nodeKey: string) {
+    clearTimeout(this.retryTimers.get(nodeKey));
+    this.retryTimers.delete(nodeKey);
+    this.failedAttemptsByNode.delete(nodeKey);
+  }
 
   private shouldStartSubscriber(sub: ShardedSubscriber): boolean {
     if (sub.isStarted()) {

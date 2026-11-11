@@ -1,6 +1,6 @@
 import { exists, hasFlag } from "@ioredis/commands";
 import { EventEmitter } from "events";
-import { AbortError, RedisError, ReplyError } from "redis-errors";
+import { AbortError, RedisError } from "redis-errors";
 import asCallback from "standard-as-callback";
 import Command from "../Command";
 import ClusterAllFailedError from "../errors/ClusterAllFailedError";
@@ -797,14 +797,11 @@ class Cluster<
               status = _this.shardedSubscribers.addChannels(channels);
 
               if (status !== -1) {
-                // The channels are tracked before the reply. Stop tracking
-                // the ones the server refused (e.g. NOPERM), or every
-                // resubscribe would fail on them and replace the subscriber.
-                command.promise.catch((err) => {
-                  if (err instanceof ReplyError) {
-                    _this.shardedSubscribers.removeChannels(channels);
-                  }
-                });
+                _this.shardedSubscribers.watchSubscribe(
+                  sub,
+                  channels,
+                  command.promise
+                );
               }
             }
 
@@ -1479,27 +1476,18 @@ class Cluster<
       }
     };
 
-    this.subscriberGroupEmitter.on("-node", (redis, nodeKey, wasConnected) => {
+    this.subscriberGroupEmitter.on("-node", (redis, nodeKey) => {
       this.emit("-node", redis, nodeKey);
 
-      if (wasConnected) {
-        this.refreshSlotsCache(refreshSlotsCacheCallback);
-      }
+      this.refreshSlotsCache(refreshSlotsCacheCallback);
     });
 
-    this.subscriberGroupEmitter.on(
-      "subscriberConnectFailed",
-      ({ delay, error }) => {
-        Redis.prototype.silentEmit.call(this, "error", error);
-
-        setTimeout(() => {
-          this.refreshSlotsCache(refreshSlotsCacheCallback);
-        }, delay);
-      }
-    );
-
-    this.subscriberGroupEmitter.on("subscribeRefused", (error) => {
+    this.subscriberGroupEmitter.on("subscriberError", (error) => {
       Redis.prototype.silentEmit.call(this, "error", error);
+    });
+
+    this.subscriberGroupEmitter.on("refreshSlots", () => {
+      this.refreshSlotsCache(refreshSlotsCacheCallback);
     });
 
     this.subscriberGroupEmitter.on("moved", () => {
