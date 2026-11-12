@@ -14,7 +14,10 @@ import {
 import { TestCommandRunner } from "../utils/command-runner";
 import { MessageTracker } from "../utils/message-tracker";
 import { assert } from "chai";
+import debug from "debug";
 
+// TEMP: trace subscriber resets while diagnosing the node-reboot failure.
+const DEBUG_NAMESPACES = "ioredis:cluster*";
 const CLUSTER_INDEX = 0;
 const POST_RECOVERY_PUBLISH_DURATION_MS = 10_000;
 const MIN_POST_RECOVERY_DELIVERY_RATIO = 0.9;
@@ -140,8 +143,13 @@ describe("Sharded Pub/Sub E2E - Failure Recovery Multiple Subscribers", () => {
   };
 
   before(() => {
+    debug.enable(DEBUG_NAMESPACES);
     config = getConfig();
     faultInjectorClient = new FaultInjectorClient(config.faultInjectorUrl);
+  });
+
+  after(() => {
+    debug.disable();
   });
 
   beforeEach(async function () {
