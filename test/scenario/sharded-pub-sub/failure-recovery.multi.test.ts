@@ -15,9 +15,14 @@ import { TestCommandRunner } from "../utils/command-runner";
 import { MessageTracker } from "../utils/message-tracker";
 import { assert } from "chai";
 import debug from "debug";
+import { format } from "util";
 
 // TEMP: trace subscriber resets while diagnosing the node-reboot failure.
+// Lines are buffered in memory and printed only when a test fails, because
+// writing them to stderr as they happen changes timing enough to hide the bug.
 const DEBUG_NAMESPACES = "ioredis:cluster*";
+const debugLines: string[] = [];
+const originalDebugLog = debug.log;
 const CLUSTER_INDEX = 0;
 const POST_RECOVERY_PUBLISH_DURATION_MS = 10_000;
 const MIN_POST_RECOVERY_DELIVERY_RATIO = 0.9;
@@ -143,6 +148,9 @@ describe("Sharded Pub/Sub E2E - Failure Recovery Multiple Subscribers", () => {
   };
 
   before(() => {
+    debug.log = (...args: unknown[]) => {
+      debugLines.push(format(...args));
+    };
     debug.enable(DEBUG_NAMESPACES);
     config = getConfig();
     faultInjectorClient = new FaultInjectorClient(config.faultInjectorUrl);
@@ -150,6 +158,14 @@ describe("Sharded Pub/Sub E2E - Failure Recovery Multiple Subscribers", () => {
 
   after(() => {
     debug.disable();
+    debug.log = originalDebugLog;
+  });
+
+  afterEach(function () {
+    if (this.currentTest?.state === "failed") {
+      process.stderr.write(debugLines.join("\n") + "\n");
+    }
+    debugLines.length = 0;
   });
 
   beforeEach(async function () {
