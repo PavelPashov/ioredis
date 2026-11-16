@@ -76,6 +76,7 @@ describe("Sharded Pub/Sub E2E - Failure Recovery Single Subscriber", () => {
     const messageTracker = new MessageTracker(channels);
     const subscriber = createClusterTestClient(config.clientConfig, {
       shardedSubscribers: true,
+      slotsRefreshInterval: 5_000,
     });
     const publisher = createClusterTestClient(config.clientConfig);
 
