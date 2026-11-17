@@ -45,8 +45,6 @@ describe("ShardedSubscriberHealthCheck", () => {
 
   beforeEach(() => {
     clock = sinon.useFakeTimers();
-    // No jitter, so pings fire on exact interval boundaries.
-    sinon.stub(Math, "random").returns(0);
     connection = new FakeConnection();
     healthCheck = new ShardedSubscriberHealthCheck(
       connection,
@@ -147,13 +145,12 @@ describe("ShardedSubscriberHealthCheck", () => {
     ).to.equal(1);
   });
 
-  it("skips the ping while messages arrive within the interval", () => {
+  it("disconnects a connection that keeps delivering messages but answers no ping", () => {
     connect();
 
     streamMessages(10);
 
-    expect(connection.ping.called, "pinged a busy connection").to.equal(false);
-    expect(connection.disconnect.called).to.equal(false);
+    expect(connection.disconnect.callCount).to.equal(1);
   });
 
   it("disconnects only once even as time passes", () => {
