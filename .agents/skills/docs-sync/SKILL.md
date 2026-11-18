@@ -44,7 +44,7 @@ For broad documentation audits, option/API coverage checks, or unclear documenta
    - For TypeScript examples or declarations, run the focused tsd test or add one when appropriate.
    - For API docs comments, run `npm run docs` when the change affects generated docs.
    - For command typing changes, run `node bin/index.js` before validating generated typings.
-   - For Markdown-only edits, inspect nearby formatting and links; run `npm run format-check` only when relevant files are covered by Prettier.
+   - For Markdown-only edits, inspect nearby formatting and links; run `npx prettier --check <changed files>` only when relevant files are covered by Prettier.
 
 ## Documentation Decision Checklist
 

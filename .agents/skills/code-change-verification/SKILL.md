@@ -5,7 +5,7 @@ description: Verify ioredis code changes before handoff. Use when an agent chang
 
 # Code Change Verification
 
-Use this skill to choose the smallest credible validation set for an ioredis change, run it when feasible, and report exactly what passed, failed, or was skipped.
+Use this skill to choose focused validation while working on an ioredis change, run `npm run verify` before handoff, and report exactly what passed, failed, or was skipped.
 
 ## Workflow
 
@@ -19,16 +19,14 @@ Use this skill to choose the smallest credible validation set for an ioredis cha
    - Redis command typing or generated command support: inspect `bin/` config, regenerate with `node bin/index.js` if needed, and run tsd or targeted typing tests.
    - Functional Redis behavior: run the smallest relevant Mocha files and assume a compatible Redis server is on default host/port. If sandboxed Redis access is blocked, ask for permission rather than assuming Redis is unavailable.
    - Cluster behavior: use `npm run docker:setup` if infrastructure is needed, then targeted `test/cluster/**/*.ts` or `npm run test:cluster`.
-   - Docs-only changes: run `npm run format-check` only if formatting-sensitive files changed; otherwise inspect rendered Markdown manually.
+   - Docs-only changes: run `npx prettier --check <changed files>` if formatting-sensitive files changed; otherwise inspect rendered Markdown manually. `npm run verify` is not needed.
    - Build/tooling changes: run `npm run build` and the affected script directly.
 
 3. Prefer focused validation before broad validation.
-   - For self-contained pure unit files, run the test file alone first: `TS_NODE_TRANSPILE_ONLY=true NODE_ENV=test npx mocha --no-experimental-strip-types "test/unit/<file>.ts"`.
-   - Include `test/helpers/*.ts` only when the unit file relies on global hooks or helper setup.
-   - Functional command change: include `test/helpers/*.ts` and the specific `test/functional/...` file.
+   - Unit or functional change: run the specific file with the global hooks: `TS_NODE_TRANSPILE_ONLY=true NODE_ENV=test npx mocha --no-experimental-strip-types "test/helpers/*.ts" "test/unit/<file>.ts"`. Always include `test/helpers/*.ts`; without it, sinon stubs leak into later tests and they fail with timeouts.
    - Typing change: `npm run build` then `npx tsd --files test/typing/<file>.test-d.ts` when a focused file exists.
-   - Public API or cross-cutting behavior: escalate to `npm test` after focused tests pass.
-   - Formatting-only TypeScript edits: run `npm run lint` or `npm run format-check` as appropriate.
+   - Before handoff of any code, test or build change: run `npm run verify` after the focused tests pass.
+   - Formatting-only TypeScript edits: run `npm run lint` and `npx prettier --check <changed files>`.
 
 4. Handle generated artifacts deliberately.
    - If `bin/argumentTypes.js`, `bin/returnTypes.js`, `bin/overrides.js`, `bin/sortArguments.js`, `bin/typeMaps.js`, or `bin/template.ts` changes command declarations, regenerate `lib/utils/RedisCommander.ts` with `node bin/index.js`.
@@ -44,9 +42,10 @@ Use this skill to choose the smallest credible validation set for an ioredis cha
 
 - `npm run build`: remove `built/` and compile TypeScript.
 - `npm run lint`: ESLint over `lib/`.
-- `npm run format-check`: Prettier check.
+- `npx prettier --check <files>`: Prettier check for the files you changed. `npm run format-check` checks the whole repo and fails on many existing files.
 - `npm run test:js`: non-cluster Mocha suite over helpers, unit, and functional tests.
 - `npm run test:cluster`: cluster Mocha suite.
 - `npm run test:tsd`: build and run all tsd tests.
 - `npm test`: `test:js` plus `test:tsd`.
+- `npm run verify`: `lint`, `npm test` and `test:cluster`; the full CI check. Needs the standalone and cluster test servers.
 - `npm run docker:setup` / `npm run docker:teardown`: start/stop Redis test infrastructure.
