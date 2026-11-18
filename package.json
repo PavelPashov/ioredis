@@ -15,6 +15,7 @@
     "test:cov": "nyc npm run test:js",
     "test:cluster": "TS_NODE_TRANSPILE_ONLY=true NODE_ENV=test mocha --no-experimental-strip-types \"test/cluster/**/*.ts\"",
     "test": "npm run test:js && npm run test:tsd",
+    "verify": "npm run lint && npm test && npm run test:cluster",
     "lint": "eslint --ext .js,.ts ./lib",
     "docs": "npx typedoc --logLevel Error --excludeExternals --excludeProtected --excludePrivate --readme none lib/index.ts",
     "format": "prettier --write \"{,!(node_modules)/**/}*.{js,ts}\"",
