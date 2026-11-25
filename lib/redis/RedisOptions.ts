@@ -220,6 +220,8 @@ export interface CommonRedisOptions extends CommanderOptions {
    */
   connectTimeout?: number | undefined;
 
+  guardDemoOption?: boolean;
+
   /**
    * This option is used internally when you call `redis.monitor()` to tell Redis
    * to enter the monitor mode when the connection is established.
