@@ -119,3 +119,5 @@ export function print(err: Error | null, reply?: any) {
     console.log("Reply: " + reply);
   }
 }
+
+export type GuardFenceProbe = "````` **bold**";
